@@ -149,21 +149,24 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("advanced", events)
         self.assertEqual(api.apply_title.await_count, 3)
         self.assertEqual(api.collect_profiles.await_count, 3)
-        self.assertEqual(filters.await_count, 3)
+        self.assertEqual(filters.await_count, 0)
         self.assertEqual(history["TEST"]["status"], "completed")
-    async def test_advanced_uses_one_explicit_full_location_not_variants(self):
-        events, history, _, api, _ = await self.run_flow(full_location="Canada")
-        self.assertEqual(events.count("advanced"), 1)
-        self.assertEqual(api.apply_location.await_args_list[0].args[1], "Canada")
-        self.assertEqual(history["TEST"]["advanced_search"]["filters"]["location"], "Canada")
-        self.assertEqual([call.args[1] for call in api.apply_location.await_args_list[1:]],
+    async def test_advanced_searches_all_location_variants(self):
+        events, history, _, api, _ = await self.run_flow()
+        self.assertEqual(events.count("advanced"), 3)
+        self.assertEqual([call.args[1] for call in api.apply_location.await_args_list[:3]],
                          ["Toronto, Ontario, Canada", "Ontario, Canada", "Canada"])
+        self.assertEqual(history["TEST"]["advanced_search"]["filters"]["locations"],
+                         ["Toronto, Ontario, Canada", "Ontario, Canada", "Canada"])
+        self.assertEqual([call.args[1] for call in api.apply_location.await_args_list[3:]],
+                         ["Toronto, Ontario, Canada", "Ontario, Canada", "Canada"])
+
     async def test_advanced_first_then_normal_merge_and_deduplicate(self):
         events, history, _, api, filters = await self.run_flow()
         self.assertLess(events.index("advanced"), events.index("title"))
         self.assertEqual(events[-1], "profiles")
-        self.assertEqual(filters.await_count, 4)
-        self.assertEqual(api.apply_title.await_count, 4)
+        self.assertEqual(filters.await_count, 3)
+        self.assertEqual(api.apply_title.await_count, 6)
         self.assertEqual(api.apply_location.await_args_list[0].args[1], "Toronto, Ontario, Canada")
         self.assertEqual(history["TEST"]["profiles"], ["shared", "advanced-only", "normal-only"])
         self.assertEqual(history["TEST"]["status"], "completed")
@@ -185,10 +188,10 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         _, history, profiles, _, _ = await self.run_flow()
         history["TEST"]["advanced_search"]["filters"]["skills"] = ["Old skill"]
         for record in history["TEST"]["location_searches"]:
-            record["filters"]["skills"] = ["Old skill"]
+            record["filters"] = {"title": "Old title", "version": 2}
         _, _, _, api, filters = await self.run_flow(history=history, profiles=profiles)
-        self.assertEqual(api.collect_profiles.await_count, 4)
-        self.assertEqual(filters.await_count, 4)
+        self.assertEqual(api.collect_profiles.await_count, 6)
+        self.assertEqual(filters.await_count, 3)
     async def test_advanced_failure_still_runs_normal_searches(self):
         events, history, _, api, _ = await self.run_flow(advanced_error=True)
         self.assertEqual(api.apply_title.await_count, 3)

@@ -24,12 +24,61 @@ def extract_json(instructions, source):
     return result
 
 
+def format_experience_range(text: str) -> str:
+    """Format single years requirement as N to N+1 range; preserve explicit ranges."""
+    if not text:
+        return ""
+    text = text.strip()
+    normalized = text.replace("\u2013", "-").replace("\u2014", "-")
+
+    # If it already has an explicit range like "2-3", "2 to 3", "3-5 years", preserve it
+    range_match = re.search(r"(\d+)\s*(?:-|to)\s*(\d+)\s*(?:years?|yrs?)?", normalized, re.I)
+    if range_match:
+        low, high = int(range_match.group(1)), int(range_match.group(2))
+        if 0 <= low <= high <= 60:
+            return f"{low}-{high} years"
+
+    # Convert word numbers to digits
+    word_map = {
+        "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+        "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
+        "eleven": "11", "twelve": "12", "fifteen": "15", "twenty": "20"
+    }
+    t = re.sub(
+        r"\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty)\b",
+        lambda m: word_map[m.group(0).lower()], normalized, flags=re.I
+    )
+
+    range_match = re.search(r"(\d+)\s*(?:-|to)\s*(\d+)\s*(?:years?|yrs?)?", t, re.I)
+    if range_match:
+        low, high = int(range_match.group(1)), int(range_match.group(2))
+        if 0 <= low <= high <= 60:
+            return f"{low}-{high} years"
+
+    # Single number mentioned without range -> return N to N+1 (e.g. 2 years -> 2-3 years)
+    num_match = re.search(r"(\d+)\s*(?:\+)?\s*(?:years?|yrs?)?", t, re.I)
+    if num_match:
+        n = int(num_match.group(1))
+        if 0 <= n <= 59:
+            return f"{n}-{n + 1} years"
+
+    return text
+
+
 def analyze_job(title, location, description, business_unit):
     description = (description or "").strip()
     result = extract_json(
         'Extract cleaned_title, city, state, country, job_description (the complete JD text '
         'from the supplied page, excluding menus and unrelated jobs), skills (array of strings '
         'or null), and experience (string describing required years/experience, or null). '
+        'For cleaned_title: clean the raw job title into a simple, standard professional job title '
+        '(e.g., "Help Desk Analyst", "Java Developer", "Project Manager"). Strictly remove all '
+        'client names, customer names, agency or department names/acronyms (such as NJAOC, SCCO, DOT, '
+        'OIT, State of NJ, NYC, etc.), business unit names, requisition/job IDs, and location names '
+        '(cities, states, countries). Never include client name, business unit, or location in '
+        'cleaned_title. Maximum 1 to 2 standard job titles only, without noise or trailing punctuation '
+        '(such as " -..", "...", "-", "."). For example: "NJAOC SCCO Help Desk Analyst -.." must '
+        'be cleaned strictly to "Help Desk Analyst". '
         'Read both the listed job location and job description to resolve the work location; '
         'ignore company headquarters and recruiter addresses. Expand state abbreviations. '
         'Look in the JD for missing work city, state and country as well. Never output '
@@ -40,18 +89,27 @@ def analyze_job(title, location, description, business_unit):
         'For Canada business unit use Canada and only a Canadian province supported by the source. '
         'If location sources conflict and cannot be resolved leave the uncertain components empty. '
         'Choose 5 to 7 distinct required professional skills from the JD, maximum 7; '
-        'return fewer when fewer are supported. No demographic or location terms as skills. '
+        'return fewer when fewer are supported. Each skill must strictly be maximum 2 words '
+        '(1 to 2 words only, e.g. "SDLC", "Agile", "Strategic Thinking", "Product Management"). '
+        'Never return multi-word sentences, clauses, or skills longer than 2 words. '
+        'No demographic or location terms as skills. '
         'Extract skills and experience ONLY from the supplied JD, never infer them from '
         'the title, location or business unit. If JD is absent, job_description, skills '
         'and experience must all be null; still clean the title and resolve the location. '
         'If the JD does not specify experience, return experience=null. '
-        'Preserve required versus preferred experience and any stated year ranges.',
+        'For experience: extract required experience years. If an exact/single number is mentioned '
+        'without a range (e.g., "2 years"), return it as a range by adding 1 (e.g., "2-3 years"). '
+        'If an explicit range is already specified (e.g., "3-5 years"), preserve that range. '
+        'Strictly do not output degree requirements, paragraphs, or qualifications prose.',
         dict(title=title, listed_location=location, job_description=description,
              business_unit=business_unit),
     )
     for key in ("cleaned_title", "city", "state", "country"):
         if not isinstance(result.get(key), str):
             raise ValueError(f"Missing job field: {key}")
+    cleaned_title = " ".join(result["cleaned_title"].split())
+    cleaned_title = re.sub(r"[\s\-_.:;]+$", "", cleaned_title).strip()
+    result["cleaned_title"] = cleaned_title
     for key in ("city", "state", "country"):
         result[key] = clean_location(result[key])
     if not description:
@@ -61,10 +119,18 @@ def analyze_job(title, location, description, business_unit):
         skills = result.get("skills")
         if skills is not None and (not isinstance(skills, list) or any(not isinstance(s, str) for s in skills)):
             raise ValueError("Invalid job skills")
-        result["skills"] = list(dict.fromkeys(s.strip() for s in (skills or []) if s.strip()))[:7] or None
+        cleaned_skills = []
+        for s in (skills or []):
+            words = [w for w in re.split(r"\s+", str(s).strip()) if w]
+            if not words:
+                continue
+            cleaned_skills.append(" ".join(words[:2]))
+        result["skills"] = list(dict.fromkeys(cleaned_skills))[:7] or None
         if result.get("experience") is not None and not isinstance(result["experience"], str):
             raise ValueError("Invalid job experience")
-        result["experience"] = (result.get("experience") or "").strip() or None
+        raw_exp = (result.get("experience") or "").strip()
+        formatted_exp = format_experience_range(raw_exp) if raw_exp else ""
+        result["experience"] = formatted_exp or None
         result["job_description"] = description
     result["location"] = ", ".join(result[k].strip() for k in ("city", "state", "country") if result[k].strip())
     if not result["country"] or not result["location"]:

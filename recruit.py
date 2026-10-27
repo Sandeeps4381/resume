@@ -127,6 +127,175 @@ async def linkedin_2fa(page):
     print("LinkedIn authenticator code submitted locally.", flush=True)
 
 
+def is_job_created_today(text):
+    if not text:
+        return True
+    text_clean = " ".join(str(text).split()).lower()
+    if "today" in text_clean:
+        return True
+    now_dates = []
+    try:
+        from zoneinfo import ZoneInfo
+        now_dates.append(datetime.now(ZoneInfo("America/New_York")))
+    except Exception:
+        now_dates.append(datetime.now(timezone(timedelta(hours=-5))))
+    now_dates.append(datetime.now(timezone.utc))
+    now_dates.append(datetime.now())
+
+    for dt in now_dates:
+        m_2 = dt.strftime("%m")
+        d_2 = dt.strftime("%d")
+        y_2 = dt.strftime("%y")
+        y_4 = dt.strftime("%Y")
+        m_1 = str(dt.month)
+        d_1 = str(dt.day)
+
+        candidates = [
+            f"{m_2}/{d_2}/{y_2}",
+            f"{m_2}/{d_2}/{y_4}",
+            f"{m_1}/{d_1}/{y_2}",
+            f"{m_1}/{d_1}/{y_4}",
+            f"{m_2}/{d_1}/{y_2}",
+            f"{m_1}/{d_2}/{y_2}",
+            f"{y_4}-{m_2}-{d_2}",
+            f"{m_2}-{d_2}-{y_4}",
+        ]
+        for c in candidates:
+            if c.lower() in text_clean:
+                return True
+    return False
+
+
+async def apply_today_job_filter(page):
+    """Apply 'Today' date filter on the 'Job Created' column in Ceipal JobPosts table."""
+    try:
+        if "/JobPosts" not in page.url:
+            return
+
+        print("Checking for 'Job Created' column to apply Today date filter...", flush=True)
+        th_locator = page.locator('th').filter(has_text=re.compile(r"Job\s+Created", re.I)).first
+        if not await th_locator.count():
+            print("Job Created column header not found.", flush=True)
+            return
+
+        # 1. Click filter icon on Job Created header
+        filter_icon = th_locator.locator('.fa-filter, [class*="filter"], svg, i, span, a, button').last
+        clicked = False
+        if await filter_icon.count() and await filter_icon.is_visible():
+            try:
+                await filter_icon.click()
+                clicked = True
+            except Exception:
+                pass
+
+        if not clicked:
+            clicked = await page.evaluate("""() => {
+                const ths = Array.from(document.querySelectorAll('th'));
+                const th = ths.find(el => /Job\\s+Created/i.test(el.innerText));
+                if (!th) return false;
+                const icon = th.querySelector('.fa-filter, [class*="filter"], svg, i, span, a, button');
+                if (icon) {
+                    icon.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                    return true;
+                }
+                th.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                return true;
+            }""")
+
+        await asyncio.sleep(1)
+
+        # 2. Look for the search input under 'Search Job Created'
+        input_locator = page.locator(
+            'div:has-text("Search Job Created") input, '
+            'input[placeholder*="Job Created" i], '
+            '.dropdown-menu:visible input, '
+            '.popover:visible input'
+        ).first
+
+        if not await input_locator.count() or not await input_locator.is_visible():
+            try:
+                await th_locator.click()
+                await asyncio.sleep(1)
+            except Exception:
+                pass
+
+        # 3. Focus and click the input to ensure the calendar datepicker is displayed
+        if await input_locator.count() and await input_locator.is_visible():
+            try:
+                await input_locator.click()
+                await asyncio.sleep(0.5)
+            except Exception:
+                pass
+
+        # 4. Click 'Today' button in the datepicker
+        today_clicked = await page.evaluate("""() => {
+            const candidates = Array.from(document.querySelectorAll(
+                '.datepicker :not(script), .bootstrap-datetimepicker-widget :not(script), ' +
+                '[class*="datepicker"] :not(script), [class*="calendar"] :not(script), ' +
+                'th, td, button, a, span, div'
+            ));
+            for (const el of candidates) {
+                if (el.offsetWidth <= 0 || el.offsetHeight <= 0) continue;
+                const text = (el.innerText || el.textContent || '').trim().toLowerCase();
+                if (text === 'today') {
+                    el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                    return true;
+                }
+            }
+            return false;
+        }""")
+
+        if not today_clicked:
+            today_btn = page.locator(
+                '.datepicker:visible :text("Today"), '
+                '.bootstrap-datetimepicker-widget:visible :text("Today"), '
+                'button:has-text("Today"):visible, '
+                'a:has-text("Today"):visible, '
+                'th:has-text("Today"):visible, '
+                ':text("Today"):visible'
+            ).last
+            if await today_btn.count() and await today_btn.is_visible():
+                await today_btn.click()
+                today_clicked = True
+
+        # 5. Ensure input has today's date filled
+        if await input_locator.count() and await input_locator.is_visible():
+            val = (await input_locator.input_value()).strip()
+            if not val:
+                try:
+                    from zoneinfo import ZoneInfo
+                    now_est = datetime.now(ZoneInfo("America/New_York"))
+                except Exception:
+                    now_est = datetime.now(timezone(timedelta(hours=-5)))
+                today_formatted = now_est.strftime("%m/%d/%Y")
+                await input_locator.fill(today_formatted)
+                print(f"Filled date input with {today_formatted}", flush=True)
+
+            await input_locator.press("Enter")
+            await input_locator.dispatch_event("change")
+
+        # 6. Fallback submit via JS
+        await page.evaluate("""() => {
+            const inputs = Array.from(document.querySelectorAll('div:has-text("Search Job Created") input, .dropdown-menu input, .popover input'));
+            for (const inp of inputs) {
+                inp.dispatchEvent(new Event('change', { bubbles: true }));
+                inp.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+            }
+        }""")
+
+        print("Applied 'Today' filter on 'Job Created' column. Waiting for table reload...", flush=True)
+        await asyncio.sleep(2.5)
+
+        # Close popover if still open
+        try:
+            await page.keyboard.press("Escape")
+        except Exception:
+            pass
+
+    except Exception as exc:
+        print(f"Notice: apply_today_job_filter error: {exc}; proceeding.", flush=True)
+
+
 async def open_job_list(page):
     print("Opening the Ceipal job list...", flush=True)
     await page.goto("https://talenthirecls12.ceipal.com/JobPosts/index",
@@ -139,6 +308,10 @@ async def open_job_list(page):
         print("Ceipal job list never rendered. URL: " + page.url, flush=True)
         raise
     print("Ceipal job list loaded.", flush=True)
+    try:
+        await apply_today_job_filter(page)
+    except Exception as exc:
+        print(f"Notice: apply_today_job_filter error: {exc}; continuing.", flush=True)
 
 
 def boolean_from_groups(groups):
@@ -557,6 +730,7 @@ async def discover_jobs(page, limit):
         seen = set()
         code_column = await job_code_column(page)
         business_unit_column = await column_index_by_header(page, "Business Unit")
+        job_created_column = await column_index_by_header(page, "Job Created")
 
         for page_number in itertools.count(1):
             rows = page.locator("tbody tr:visible").filter(
@@ -576,6 +750,13 @@ async def discover_jobs(page, limit):
 
                 title = (await links.nth(1).inner_text()).strip()
                 cells = await row.locator("td").all_inner_texts()
+
+                job_created = ""
+                if job_created_column is not None and job_created_column < len(cells):
+                    job_created = cells[job_created_column].strip()
+                    if job_created and not is_job_created_today(job_created):
+                        print(f"  skipping job {title!r}: created {job_created!r}, not today.", flush=True)
+                        continue
 
                 location = ""
                 for index, cell in enumerate(cells[:-1]):
@@ -608,10 +789,11 @@ async def discover_jobs(page, limit):
                     "code": code,
                     "business_unit": business_unit,
                     "date_posted": date_posted,
+                    "job_created": job_created,
                 }
                 print(
                     f"  job found: code={job_code_for(url)!r} title={title!r} "
-                    f"location={location!r} business_unit={business_unit!r} date_posted={date_posted!r}",
+                    f"location={location!r} business_unit={business_unit!r} date_posted={date_posted!r} job_created={job_created!r}",
                     flush=True,
                 )
 
@@ -736,14 +918,71 @@ async def ensure_result_visible(page, identifier, steps=40):
     return await page.evaluate(RESULT_PRESENT_JS, identifier)
 
 
+COLLECT_PAGE_PROFILES_JS = r"""els => {
+  const normalize = s => (s || '').trim().replace(/\s+/g, ' ').toLowerCase();
+  const isLinkedInMember = el => {
+    const text = normalize(el.innerText || el.textContent);
+    if (text === 'linkedin member') return true;
+    const aria = normalize(el.getAttribute('aria-label'));
+    if (aria === 'linkedin member' || aria.includes('linkedin member')) return true;
+    const title = normalize(el.getAttribute('title'));
+    if (title === 'linkedin member' || title.includes('linkedin member')) return true;
+
+    const card = el.closest('li, [data-test-search-result], [data-live-test-search-result], .search-result, .artdeco-list__item, .re-search-result, [data-test-row-lockup]') || el.parentElement?.parentElement;
+    if (card) {
+      const nameEls = card.querySelectorAll('a[href*="/talent/profile/"], [data-test-row-lockup-full-name], .artdeco-entity-lockup__title, .search-result__title, h3, h4, [data-control-name="view_profile"]');
+      for (const ne of nameEls) {
+        const nt = normalize(ne.innerText || ne.textContent);
+        if (nt === 'linkedin member') return true;
+        const na = normalize(ne.getAttribute('aria-label'));
+        if (na === 'linkedin member' || na.includes('linkedin member')) return true;
+      }
+      if (card.querySelector('img[alt*="LinkedIn Member" i]')) return true;
+      const lines = (card.innerText || '').split('\n').map(l => normalize(l)).filter(Boolean);
+      if (lines.slice(0, 3).includes('linkedin member')) return true;
+    }
+    return false;
+  };
+
+  return els.map(el => ({
+    href: el.href || el.getAttribute('href') || '',
+    is_member: isLinkedInMember(el)
+  }));
+}"""
+
+
 async def collect_page_profiles(page, selector, urls, limit):
     previous = -1
     at_end = False
+    skipped_members = set()
     for _ in range(60):
-        for href in await page.locator(selector).evaluate_all("els => els.map(el => el.href)"):
-            url = canonical_url(href)
-            if url and url not in urls:
-                urls.append(url)
+        items = await page.locator(selector).evaluate_all(COLLECT_PAGE_PROFILES_JS)
+        if items and isinstance(items[0], str):
+            for href in items:
+                url = canonical_url(href)
+                if url and url not in urls:
+                    urls.append(url)
+        else:
+            member_urls = set()
+            candidates = []
+            for item in (items or []):
+                url = canonical_url(item.get("href") if isinstance(item, dict) else str(item))
+                if not url:
+                    continue
+                if isinstance(item, dict) and item.get("is_member"):
+                    member_urls.add(url)
+                else:
+                    candidates.append(url)
+
+            new_skipped = member_urls - skipped_members
+            if new_skipped:
+                print(f"Skipped {len(new_skipped)} 'LinkedIn Member' profile(s) from collection.", flush=True)
+                skipped_members.update(new_skipped)
+
+            for url in candidates:
+                if url not in member_urls and url not in urls:
+                    urls.append(url)
+
         print(f"Profiles collected so far: {len(urls)}", flush=True)
         if len(urls) >= limit or (at_end and len(urls) == previous):
             break
@@ -840,7 +1079,7 @@ def main():
     parser.add_argument("--search-only", action="store_true", help="Test title/location search without uploading applicants")
     parser.add_argument("--jobs-only", action="store_true", help="Collect/cache jobs without waiting for LinkedIn or AI")
     parser.set_defaults(jd_file=None)
-    parser.add_argument("--limit", type=int, choices=range(1, 21), default=20)
+    parser.add_argument("--limit", type=int, choices=range(1, 21), default=30)
     args = parser.parse_args()
     if args.jobs_limit is not None and args.jobs_limit < 1:
         parser.error("--jobs-limit must be greater than zero")
@@ -848,6 +1087,8 @@ def main():
     job_path = ROOT / "extract_job.json"
     profile_path = ROOT / "profile_data.json"
     history_path = ROOT / "job_history.json"
+    from state_store import check_and_perform_daily_8am_est_cleanup
+    check_and_perform_daily_8am_est_cleanup(ROOT)
     cleanup_old_job_data(job_path, profile_path, history_path)
 
     try:

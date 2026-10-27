@@ -96,26 +96,39 @@ async def apply_skills(page, skills):
     if not skills:
         return
     selector = os.getenv("LINKEDIN_SKILLS_SELECTOR", "").strip()
-    if selector:
-        field = page.locator(selector).first
-    else:
+
+    async def get_field():
+        if selector:
+            return page.locator(selector).first
         control = await first_visible(page.get_by_text("Skill keywords anywhere on profile", exact=True))
         if control:
             await control.click()
         field = await first_visible(page.get_by_placeholder(re.compile(r"skill|keyword", re.I)))
         if not field:
             field = await first_visible(page.get_by_role("combobox", name=re.compile(r"skill", re.I)))
-    if not field:
-        raise RuntimeError("Skills input not found; set LINKEDIN_SKILLS_SELECTOR")
-    # Skills keywords field supports Boolean input; use source skills verbatim.
-    expression = " AND ".join('"' + skill.replace('"', '') + '"' for skill in skills)
-    await field.fill(expression)
-    await field.press("Enter")
-    await asyncio.sleep(1)
-    chip = await first_visible(page.get_by_role("button", name=re.compile(r"^Remove .*" + re.escape(skills[0]), re.I)))
-    if not chip:
-        raise RuntimeError("Skills filter not confirmed after Enter; check LINKEDIN_SKILLS_SELECTOR")
-    print(f"LinkedIn skills applied: {expression}", flush=True)
+        return field
+
+    applied_skills = []
+    for skill in skills:
+        clean_skill = str(skill).strip().replace('"', '')
+        if not clean_skill:
+            continue
+        field = await get_field()
+        if not field:
+            raise RuntimeError("Skills input not found; set LINKEDIN_SKILLS_SELECTOR")
+        await field.click()
+        await field.fill(clean_skill)
+        await asyncio.sleep(0.5)
+        await field.press("Enter")
+        await asyncio.sleep(1)
+        applied_skills.append(clean_skill)
+        print(f"LinkedIn skill applied: {clean_skill}", flush=True)
+
+    if applied_skills:
+        chip = await first_visible(page.get_by_role("button", name=re.compile(r"^Remove .*" + re.escape(applied_skills[0]), re.I)))
+        if not chip:
+            print(f"LinkedIn skills applied ({len(applied_skills)} skills); chip check warning.", flush=True)
+    print(f"LinkedIn all skills applied: {applied_skills}", flush=True)
 
 
 async def visible_experience_panel(page):
@@ -253,48 +266,126 @@ async def apply_jd_filters(page, requirements, wait_between=False):
     await apply_skills(page, requirements["skills"])
     if requirements["skills"]:
         await wait_for_filter_step("skills selected")
-    await apply_experience(page, requirements["experience"])
-    if wait_between and requirements["experience"]:
-        await wait_for_filter_step("experience Update completed")
+    if requirements.get("experience"):
+        try:
+            await apply_experience(page, requirements["experience"])
+            if wait_between:
+                await wait_for_filter_step("experience Update completed")
+        except Exception as exc:
+            print(f"LinkedIn experience filter skipped ({exc}); continuing search with skills.", flush=True)
 
-async def run_advanced_search(api, args, linkedin, code, source_location, requirements, saved_job, persist_history, title=""):
-    """Run/cache the JD-first full-location pass; return its tracking record and URLs."""
-    # First pass applies title, full location and JD requirements with waits between steps.
+async def run_advanced_search(api, args, linkedin, code, locations, requirements, saved_job, persist_history, title=""):
+    """Run/cache JD-first pass(es) across all location variations; return tracking record and URLs."""
     advanced = None
     advanced_urls = []
     if requirements["has_jd"] and advanced_search_enabled():
-        signature = dict(title=title, location=source_location, skills=requirements["skills"],
-                         experience=requirements["experience"], version=2)
+        if isinstance(locations, str):
+            location_variants = [locations]
+        else:
+            location_variants = list(locations or [])
+        location_variants = list(dict.fromkeys(
+            " ".join(str(v or "").split()) for v in location_variants if " ".join(str(v or "").split())
+        ))[:3]
+        if not location_variants:
+            return None, []
+
+        signature = dict(
+            title=title,
+            location=location_variants[0] if location_variants else "",
+            locations=location_variants,
+            skills=requirements["skills"],
+            experience=requirements["experience"],
+            version=3
+        )
         advanced = saved_job.get("advanced_search") or {}
         if (not args.search_only and advanced.get("filters") == signature
                 and advanced.get("search_status") == "completed"):
-            advanced_urls = advanced.get("profiles", [])[:10]
-            print(f"Job {code}: reusing Advanced Search URLs.", flush=True)
+            advanced_urls = advanced.get("profiles", [])[:20]
+            print(f"Job {code}: reusing Advanced Search URLs ({len(advanced_urls)}).", flush=True)
+            return advanced, advanced_urls
+
+        advanced = dict(
+            filters=signature,
+            status="pending",
+            profiles=[],
+            location_searches=advanced.get("location_searches", []) if advanced.get("filters") == signature else []
+        )
+        saved_job["advanced_search"] = advanced
+        persist_history()
+        adv_location_searches = advanced.setdefault("location_searches", [])
+        all_advanced_candidates = []
+
+        for pass_number, variant in enumerate(location_variants, start=1):
+            if len(all_advanced_candidates) >= 20 and not args.search_only:
+                print(f"Job {code}: Already reached 20 Advanced Search profiles; skipping remaining passes.", flush=True)
+                break
+
+            record = next(
+                (item for item in adv_location_searches if item.get("pass") == pass_number),
+                None,
+            )
+            if (record and record.get("filters") == signature and record.get("location") == variant
+                    and (record.get("status") in {"processing", "collected", "completed"}
+                         or record.get("search_status") == "completed")
+                    and not args.search_only):
+                candidates = record.get("profiles", [])
+                print(f"Job {code}: reusing Advanced Search pass {pass_number} for {variant!r} ({len(candidates)} profile(s)).", flush=True)
+            else:
+                candidates = None
+
+            if candidates is None:
+                try:
+                    print(f"Job {code}: next step - running Advanced Search pass {pass_number} for {variant!r}...", flush=True)
+                    await open_advanced_search(linkedin, api)
+                    await wait_for_filter_step("Advanced Search opened")
+                    await clear_search_filters(linkedin)
+                    await wait_for_filter_step("old filters cleared")
+                    if title:
+                        await api.apply_title(linkedin, title)
+                        await wait_for_filter_step("job title selected")
+                    await api.apply_location(linkedin, variant)
+                    await wait_for_filter_step(f"location variant {pass_number} ({variant}) selected")
+                    await apply_jd_filters(linkedin, requirements, wait_between=True)
+                    await wait_for_filter_step("filters ready before Search")
+                    await submit_search(linkedin, required=True)
+                    await api.wait_for_search_results(linkedin)
+                    needed = max(1, 20 - len(all_advanced_candidates)) if not args.search_only else 20
+                    candidates = (await api.collect_profiles(linkedin, needed))[:needed]
+                except Exception as exc:
+                    if record is None:
+                        record = {"pass": pass_number, "location": variant, "profiles": []}
+                        adv_location_searches.append(record)
+                    record.update(filters=signature, search_status="failed", status="failed", error=str(exc))
+                    persist_history()
+                    print(f"Job {code}: Advanced Search pass {pass_number} ({variant}) failed: {exc}; continuing to next variant.", flush=True)
+                    continue
+
+            # Cap candidates to only what is needed up to 20
+            remaining_slots = max(0, 20 - len(all_advanced_candidates)) if not args.search_only else len(candidates)
+            needed_candidates = candidates[:remaining_slots]
+
+            if record is None:
+                record = {"pass": pass_number, "location": variant}
+                adv_location_searches.append(record)
+            record["filters"] = signature
+            record.pop("error", None)
+            record["location"] = variant
+            record["profiles"] = needed_candidates
+            record["search_status"] = "completed"
+            record["status"] = "collected"
+            all_advanced_candidates.extend(needed_candidates)
+            persist_history()
+            print(f"Job {code}: Advanced Search pass {pass_number} using {variant!r} returned {len(needed_candidates)} profile(s) (total: {len(all_advanced_candidates)}/20).", flush=True)
+
+        advanced_urls = list(dict.fromkeys(all_advanced_candidates))[:20]
+        if any(r.get("search_status") == "completed" for r in adv_location_searches):
+            advanced.update(profiles=advanced_urls, search_status="completed", status="collected")
+            print(f"Job {code}: Advanced Search location pass(es) finished; {len(advanced_urls)} profile(s) collected (max 20).", flush=True)
         else:
-            advanced = dict(filters=signature, status="pending", profiles=[])
-            saved_job["advanced_search"] = advanced
-            persist_history()
-            try:
-                await open_advanced_search(linkedin, api)
-                await wait_for_filter_step("Advanced Search opened")
-                await clear_search_filters(linkedin)
-                await wait_for_filter_step("old filters cleared")
-                if title:
-                    await api.apply_title(linkedin, title)
-                    await wait_for_filter_step("job title selected")
-                await api.apply_location(linkedin, source_location)
-                await wait_for_filter_step("full location selected")
-                await apply_jd_filters(linkedin, requirements, wait_between=True)
-                await wait_for_filter_step("filters ready before Search")
-                await submit_search(linkedin, required=True)
-                await api.wait_for_search_results(linkedin)
-                advanced_urls = (await api.collect_profiles(linkedin, 10))[:10]
-                advanced.update(profiles=advanced_urls, search_status="completed", status="collected")
-                print(f"Job {code}: Advanced Search collected {len(advanced_urls)} profiles; starting title searches.", flush=True)
-            except Exception as exc:
-                advanced.update(search_status="failed", status="failed", error=str(exc))
-                print(f"Job {code}: Advanced Search failed: {exc}; trying normal title searches.", flush=True)
-            persist_history()
+            advanced.update(profiles=[], search_status="failed", status="failed")
+            print(f"Job {code}: Advanced Search all passes failed; continuing with normal searches.", flush=True)
+        persist_history()
+
 
     return advanced, advanced_urls
 

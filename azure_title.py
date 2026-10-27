@@ -195,7 +195,7 @@ def validate_city_location(location: str) -> bool:
 
 
 def clean_job_title(raw_title: str) -> str:
-    """Return a cleaned job title in maximum 2 words."""
+    """Return a simple cleaned job title without client name, business unit, location, or noise."""
     if raw_title is None:
         return ""
 
@@ -204,13 +204,15 @@ def clean_job_title(raw_title: str) -> str:
         return ""
 
     prompt = (
-        "You clean messy job titles extracted from ATS, LinkedIn, or job boards. "
+        "You clean messy job titles extracted from ATS, LinkedIn, or job boards into simple standard job titles. "
         "Return JSON only with keys original_title and cleaned_title. "
-        "Preserve the main role meaning. "
-        "Fix casing, spacing, punctuation, and expand acronyms only when very clear. "
-        "Remove level indicators like L2, L3, II, III, Level 2, Level 3, numeric grades, and extra noise. "
-        "Return the cleaned_title in STRICTLY maximum 2 words only. "
-        "Do not return more than 2 words."
+        "Strict rules for cleaned_title: "
+        "1. Strictly remove all client names, customer names, agency or department names/acronyms (e.g. NJAOC, SCCO, DOT, NYC, State of NJ, etc.), business unit names, and requisition codes. "
+        "2. Strictly remove all location names (cities, states, countries). "
+        "3. Keep only the core, standard professional role/job title (maximum 1 to 2 standard titles, e.g. 'Help Desk Analyst', 'Java Developer', 'Data Analyst'). "
+        "4. Remove level indicators like L2, L3, II, III, Level 2, numeric grades, and trailing punctuation like ' -..', '...', etc. "
+        "5. Example: 'NJAOC SCCO Help Desk Analyst -..' must be cleaned strictly to 'Help Desk Analyst'. "
+        "Do not include any client name, business unit, or location in cleaned_title."
     )
 
     body = {
@@ -229,11 +231,11 @@ def clean_job_title(raw_title: str) -> str:
     try:
         parsed = json.loads(content)
     except json.JSONDecodeError as exc:
-        raise ValueError(f"Ollama returned non-JSON content: {content}") from exc
+        raise ValueError(f"AI returned non-JSON content: {content}") from exc
 
     cleaned = " ".join(str(parsed.get("cleaned_title", "")).split())
-    cleaned_words = cleaned.split()[:2]
-    return " ".join(cleaned_words) if cleaned_words else original
+    cleaned = re.sub(r"[\s\-_.:;]+$", "", cleaned).strip()
+    return cleaned or original
 
 
 def clean_job_location(raw_location: str) -> str:

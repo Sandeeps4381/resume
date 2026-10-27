@@ -154,14 +154,31 @@ def update_linkedin_havesting_status(
     job_title=None,
     cleaned_job_title=None,
     date_posted=None,
+    tag_profile=0,
 ):
     if not url:
         return
 
-    table = os.getenv("DB_PROFILE_URL")
+    table = os.getenv("DB_PROFILE_URL") or os.getenv("DB_TABLE", "linkedin_havesting_url")
     conn = db_connect()
     try:
         cur = conn.cursor()
+        tag_val = 1 if tag_profile else 0
+
+        def exec_sql(query_with_tag, params_with_tag, query_fallback, params_fallback):
+            try:
+                cur.execute(query_with_tag, params_with_tag)
+            except Exception as exc:
+                err_str = str(exc).lower()
+                if "tag_profile" in err_str or "unknown column" in err_str:
+                    try:
+                        cur.execute(f"ALTER TABLE {table} ADD COLUMN tag_profile TINYINT(1) DEFAULT 0")
+                        conn.commit()
+                        cur.execute(query_with_tag, params_with_tag)
+                    except Exception:
+                        cur.execute(query_fallback, params_fallback)
+                else:
+                    raise
 
         if job_code:
             cur.execute(
@@ -171,7 +188,18 @@ def update_linkedin_havesting_status(
             existing = cur.fetchone()
 
             if existing:
-                cur.execute(
+                exec_sql(
+                    f"UPDATE {table} SET status=%s, business_unit=%s, job_title=%s, cleaned_job_title=%s, date_posted=%s, tag_profile=%s WHERE url=%s AND job_code=%s",
+                    (
+                        status,
+                        business_unit,
+                        job_title,
+                        cleaned_job_title,
+                        date_posted,
+                        tag_val,
+                        url,
+                        job_code,
+                    ),
                     f"UPDATE {table} SET status=%s, business_unit=%s, job_title=%s, cleaned_job_title=%s, date_posted=%s WHERE url=%s AND job_code=%s",
                     (
                         status,
@@ -184,7 +212,18 @@ def update_linkedin_havesting_status(
                     ),
                 )
             else:
-                cur.execute(
+                exec_sql(
+                    f"INSERT INTO {table} (url, job_code, business_unit, status, job_title, cleaned_job_title, date_posted, tag_profile) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                    (
+                        url,
+                        job_code,
+                        business_unit,
+                        status,
+                        job_title,
+                        cleaned_job_title,
+                        date_posted,
+                        tag_val,
+                    ),
                     f"INSERT INTO {table} (url, job_code, business_unit, status, job_title, cleaned_job_title, date_posted) VALUES (%s, %s, %s, %s, %s, %s, %s)",
                     (
                         url,
@@ -201,12 +240,16 @@ def update_linkedin_havesting_status(
             existing = cur.fetchone()
 
             if existing:
-                cur.execute(
+                exec_sql(
+                    f"UPDATE {table} SET status=%s, job_title=%s, cleaned_job_title=%s, date_posted=%s, tag_profile=%s WHERE url=%s",
+                    (status, job_title, cleaned_job_title, date_posted, tag_val, url),
                     f"UPDATE {table} SET status=%s, job_title=%s, cleaned_job_title=%s, date_posted=%s WHERE url=%s",
                     (status, job_title, cleaned_job_title, date_posted, url),
                 )
             else:
-                cur.execute(
+                exec_sql(
+                    f"INSERT INTO {table} (url, status, job_title, cleaned_job_title, date_posted, tag_profile) VALUES (%s, %s, %s, %s, %s, %s)",
+                    (url, status, job_title, cleaned_job_title, date_posted, tag_val),
                     f"INSERT INTO {table} (url, status, job_title, cleaned_job_title, date_posted) VALUES (%s, %s, %s, %s, %s)",
                     (url, status, job_title, cleaned_job_title, date_posted),
                 )
@@ -1473,6 +1516,7 @@ async def create_applicant(page, row, api, persist, job_code=None):
             if await duplicate.count() and await duplicate.is_visible():
                 row["status"] = "duplicate"
                 row["public_url"] = db_url
+                row["tag_profile"] = 0
                 persist()
                 cleanup_resume_file()
                 if job_code:
@@ -1484,6 +1528,7 @@ async def create_applicant(page, row, api, persist, job_code=None):
                         job_title=row.get("job_title"),
                         cleaned_job_title=row.get("cleaned_job_title"),
                         date_posted=row.get("date_posted") or datetime.now(),
+                        tag_profile=0,
                     )
                     update_job_processing_status(job_code, 1)
                 print("    Ceipal already knows this applicant.", flush=True)
@@ -1509,7 +1554,8 @@ async def create_applicant(page, row, api, persist, job_code=None):
                 hashlib.sha256(row["url"].encode()).hexdigest()[:16]
             )
         if not row.get("dummy_mobile"):
-            row["dummy_mobile"] = api.existing.dummy_mobile().rstrip(".")
+            # .rstrip(".") ko hata diya taaki dots end mein safe rahein
+            row["dummy_mobile"] = api.existing.dummy_mobile() 
         await ensure_applicant_field(
             page, (api.existing.CEIPAL_EMAIL_SELECTOR, 'input[type="email"]'),
             r"^email\s*(address)?\s*\*?$", row["dummy_email"], "Email"
@@ -1546,20 +1592,9 @@ async def create_applicant(page, row, api, persist, job_code=None):
                 row["public_url"] = db_url
                 persist()
 
-                progress(f"Applicant save confirmed: {page.url}; updating database tracking...")
+                progress(f"Applicant save confirmed: {page.url}; tagging pipeline...")
 
-                if job_code:
-                    update_linkedin_havesting_status(
-                        db_url,
-                        job_code,
-                        row.get("business_unit"),
-                        1,
-                        job_title=row.get("job_title"),
-                        cleaned_job_title=row.get("cleaned_job_title"),
-                        date_posted=row.get("date_posted") or datetime.now(),
-                    )
-                    update_job_processing_status(job_code, 1)
-
+                tagged = False
                 try:
                     if job_code in (row.get("advanced_search_job_codes") or []):
                         progress("Save confirmed; waiting 5 seconds before Quick Tag...")
@@ -1577,6 +1612,23 @@ async def create_applicant(page, row, api, persist, job_code=None):
                     persist()
                     print(f"    tag job failed but continuing: {exc}", flush=True)
 
+                tag_profile_val = 1 if tagged else 0
+                row["tag_profile"] = tag_profile_val
+                persist()
+
+                if job_code:
+                    update_linkedin_havesting_status(
+                        db_url,
+                        job_code,
+                        row.get("business_unit"),
+                        1,
+                        job_title=row.get("job_title"),
+                        cleaned_job_title=row.get("cleaned_job_title"),
+                        date_posted=row.get("date_posted") or datetime.now(),
+                        tag_profile=tag_profile_val,
+                    )
+                    update_job_processing_status(job_code, 1)
+
                 cleanup_resume_file()
                 progress("Applicant processing finished: saved.")
                 return
@@ -1585,6 +1637,7 @@ async def create_applicant(page, row, api, persist, job_code=None):
             if await duplicate_modal.count() and await duplicate_modal.is_visible():
                 row["status"] = "duplicate"
                 row["public_url"] = db_url
+                row["tag_profile"] = 0
                 persist()
                 cleanup_resume_file()
                 if job_code:
@@ -1596,9 +1649,11 @@ async def create_applicant(page, row, api, persist, job_code=None):
                         job_title=row.get("job_title"),
                         cleaned_job_title=row.get("cleaned_job_title"),
                         date_posted=row.get("date_posted") or datetime.now(),
+                        tag_profile=0,
                     )
                     update_job_processing_status(job_code, 1)
                 return
+
 
             await asyncio.sleep(1)
 
@@ -2649,12 +2704,15 @@ async def upload_pending_resumes(api, args, page, jobs, profiles, persist):
             continue
 
 async def run(api, args):
+    from state_store import check_and_perform_daily_8am_est_cleanup
+    check_and_perform_daily_8am_est_cleanup(api.ROOT)
     job_path = api.ROOT / "extract_job.json"
     profile_path = api.ROOT / "profile_data.json"
     history_path = api.ROOT / "job_history.json"
     jobs = read_store(job_path)
     profiles = read_store(profile_path)
     history = read_store(history_path)
+
 
     for code, job in jobs.items():
         job["job_index"] = normalize_job_index(job.get("business_unit") or job.get("job_index"))
@@ -2700,7 +2758,7 @@ async def run(api, args):
         # Extracted candidate content stays in memory for PDF creation only.
         tracking_fields = {
             "url", "public_url", "status", "job_codes", "extraction_version",
-            "resume_path", "resume_deleted", "applicant_url", "tag_job_status", "advanced_search_job_codes",
+            "resume_path", "resume_deleted", "applicant_url", "tag_job_status", "tag_profile", "advanced_search_job_codes",
             "city", "state", "country", "location", "location_source",
             "location_validation", "city_location_validated",
             "business_unit", "job_index", "job_title", "cleaned_job_title", "date_posted", "error",
@@ -2752,52 +2810,110 @@ async def run(api, args):
                     if job is None:
                         queue.task_done()
                         return
-                    cached_job = jobs[job["code"]]
-                    if not args.search_only:
-                        cached_job["linkedin_processing"] = "processing"
-                        cached_job["linkedin_started_at"] = datetime.now(timezone.utc).isoformat()
-                        api.save_state(job_path, jobs)
-                    print(
-                        f"Starting LinkedIn job {job['code']} | business unit={job.get('business_unit')} | priority index={job_sort_key(job)[0]}",
-                        flush=True,
-                    )
-                    try:
-                        await process_job(
-                            api,
-                            args,
-                            linkedin,
-                            profile_page,
-                            applicant_page,
-                            job,
-                            profiles,
-                            history,
-                            history_path,
-                            persist,
-                        )
-                    except Exception as exc:
-                        failures.append(job["code"])
+                    batch_jobs = [job]
+                    while not queue.empty():
+                        try:
+                            next_job = queue.get_nowait()
+                            if next_job is None:
+                                break
+                            batch_jobs.append(next_job)
+                        except asyncio.QueueEmpty:
+                            break
+
+                    print(f"\n=======================================================", flush=True)
+                    print(f"🚀 PART 1: Running Advanced Search & Tag Pipeline for {len(batch_jobs)} job(s)...", flush=True)
+                    print(f"=======================================================\n", flush=True)
+
+                    for current_job in batch_jobs:
+                        cached_job = jobs.get(current_job["code"], current_job)
+                        if not args.search_only:
+                            cached_job["linkedin_processing"] = "processing"
+                            cached_job["linkedin_started_at"] = datetime.now(timezone.utc).isoformat()
+                            api.save_state(job_path, jobs)
                         print(
-                            f"Job {job['code']} incomplete: {type(exc).__name__}: {exc}",
+                            f"Starting Part 1 (Advanced Search) for Job {current_job['code']} | business unit={current_job.get('business_unit')} | priority index={job_sort_key(current_job)[0]}",
                             flush=True,
                         )
-                    finally:
-                        if not args.search_only:
-                            complete = history.get(job["code"], {}).get("status") == "completed"
-                            cached_job["linkedin_processing"] = "completed" if complete else "pending"
-                            if complete:
-                                cached_job["linkedin_completed_at"] = datetime.now(timezone.utc).isoformat()
-                            api.save_state(job_path, jobs)
+                        try:
+                            await process_job(
+                                api,
+                                args,
+                                linkedin,
+                                profile_page,
+                                applicant_page,
+                                current_job,
+                                profiles,
+                                history,
+                                history_path,
+                                persist,
+                                phase=1,
+                            )
+                        except Exception as exc:
+                            failures.append(current_job["code"])
                             print(
-                                f"Job {job['code']}: history checked; LinkedIn {cached_job['linkedin_processing']}.",
+                                f"Job {current_job['code']} Part 1 incomplete: {type(exc).__name__}: {exc}",
                                 flush=True,
                             )
-                        queue.task_done()
+                    print(f"\n=======================================================", flush=True)
+                    print(f"✅ PART 1 COMPLETED for all {len(batch_jobs)} job(s) till profile tagging.", flush=True)
+                    print(f"🚀 PART 2: Starting Normal Search & Profile Save for all jobs...", flush=True)
+                    print(f"=======================================================\n", flush=True)
+
+                    # Part 2: Normal Search for all jobs and save profiles
+                    for current_job in batch_jobs:
+                        print(
+                            f"Starting Part 2 (Normal Search) for Job {current_job['code']}...",
+                            flush=True,
+                        )
+                        try:
+                            await process_job(
+                                api,
+                                args,
+                                linkedin,
+                                profile_page,
+                                applicant_page,
+                                current_job,
+                                profiles,
+                                history,
+                                history_path,
+                                persist,
+                                phase=2,
+                            )
+                        except Exception as exc:
+                            failures.append(current_job["code"])
+                            print(
+                                f"Job {current_job['code']} Part 2 incomplete: {type(exc).__name__}: {exc}",
+                                flush=True,
+                            )
+                        finally:
+                            if not args.search_only:
+                                complete = history.get(current_job["code"], {}).get("status") == "completed"
+                                cached_job = jobs.get(current_job["code"], current_job)
+                                cached_job["linkedin_processing"] = "completed" if complete else "pending"
+                                if complete:
+                                    cached_job["linkedin_completed_at"] = datetime.now(timezone.utc).isoformat()
+                                api.save_state(job_path, jobs)
+                                print(
+                                    f"Job {current_job['code']}: history checked; LinkedIn {cached_job['linkedin_processing']}.",
+                                    flush=True,
+                                )
+                            queue.task_done()
 
             # Default full run keeps watching after a batch; scoped/test modes exit.
             watch_jobs = not args.search_only and not args.job_url
             round_number = 0
+
+            async def sleep_with_daily_cleanup_check(seconds, step=5):
+                end_time = time.time() + seconds
+                while time.time() < end_time:
+                    if check_and_perform_daily_8am_est_cleanup(api.ROOT, jobs, profiles, history):
+                        return True
+                    await asyncio.sleep(min(step, max(0.1, end_time - time.time())))
+                return False
+
             while True:
                 round_number += 1
+                check_and_perform_daily_8am_est_cleanup(api.ROOT, jobs, profiles, history)
                 if round_number > 1:
                     queue = asyncio.Queue()
                     startup_codes = set()
@@ -2808,7 +2924,7 @@ async def run(api, args):
                         await api.open_job_list(ceipal)
                     except Exception as exc:
                         print(f"Job list refresh failed: {exc}; retrying in 30 seconds.", flush=True)
-                        await asyncio.sleep(30)
+                        await sleep_with_daily_cleanup_check(30)
                         continue
                 consumer = asyncio.create_task(consume_jobs())
                 producer = asyncio.create_task(
@@ -2836,13 +2952,13 @@ async def run(api, args):
                 )
                 if incomplete:
                     print("Batch has pending jobs; retrying pending work in 30 seconds.", flush=True)
-                    await asyncio.sleep(30)
+                    await sleep_with_daily_cleanup_check(30)
                 elif failures:
                     print("Discovery errors; checking job list again in 30 seconds. Ctrl+C to stop.", flush=True)
-                    await asyncio.sleep(30)
+                    await sleep_with_daily_cleanup_check(30)
                 elif not startup_codes:
                     print("No new jobs; checking job list again in 10 minutes. Ctrl+C to stop.", flush=True)
-                    await asyncio.sleep(600)
+                    await sleep_with_daily_cleanup_check(600)
                 else:
                     print("All queued jobs completed; refreshing the job list now. Ctrl+C to stop.", flush=True)
         finally:
@@ -2950,6 +3066,15 @@ async def prepare_candidate_profiles(api, args, profile_page, applicant_page, jo
             public_url = (row.get("raw") or {}).get("public_url") or row.get("public_url")
             if public_url and await asyncio.to_thread(linkedin_public_url_exists, public_url, code):
                 raise ExistingProfileSkipped(public_url)
+
+            raw_name = " ".join(str((row.get("raw") or {}).get("name") or "").split()).casefold()
+            if raw_name == "linkedin member":
+                row["status"] = "skipped_linkedin_member"
+                row["tag_job_status"] = "skipped_linkedin_member"
+                profiles[url] = row
+                persist()
+                print(f"LinkedIn Member profile: extraction/resume skipped for {url}", flush=True)
+                continue
 
             if not row.get("profile"):
                 row["profile"] = await asyncio.to_thread(build_ai_resume_profile, row["raw"])
@@ -3103,7 +3228,7 @@ async def prepare_candidate_profiles(api, args, profile_page, applicant_page, jo
     )
 
 
-async def process_job(api, args, linkedin, profile_page, applicant_page, job, profiles, history, history_path, persist):
+async def process_job(api, args, linkedin, profile_page, applicant_page, job, profiles, history, history_path, persist, phase=None):
     from linkedin_search import (
         job_search_requirements, run_advanced_search, apply_jd_filters, submit_search, clear_search_filters, advanced_search_enabled
     )
@@ -3151,30 +3276,64 @@ async def process_job(api, args, linkedin, profile_page, applicant_page, job, pr
             "LinkedIn search was not started."
         )
 
-    # Advanced Search has exactly one full-location pass, independent of normal variants.
-    advanced_location = " ".join(str(
-        (job.get("location_details") or {}).get("full_location")
-        or (job.get("ai_final_location") or {}).get("location")
-        or job.get("location") or source_location
-    ).split())
-    advanced, advanced_urls = await run_advanced_search(
-        api, args, linkedin, code, advanced_location, requirements, saved_job,
-        lambda: api.save_state(history_path, history),
-        title=job.get("cleaned_title") or job["title"],
-    )
+    # -------------------------------------------------------------
+    # PART 1: Advanced Search & Profile Tagging Pipeline
+    # -------------------------------------------------------------
+    if phase in (None, 1):
+        if not (saved_job.get("advanced_pipeline_status") == "completed" and not args.search_only):
+            advanced, advanced_urls = await run_advanced_search(
+                api, args, linkedin, code, location_variants, requirements, saved_job,
+                lambda: api.save_state(history_path, history),
+                title=job.get("cleaned_title") or job["title"],
+            )
+            advanced_urls = list(dict.fromkeys(advanced_urls))[:20]
+            saved_job["profiles"] = advanced_urls
+            history[code] = saved_job
+            api.save_state(history_path, history)
+
+            if not args.search_only and advanced_urls:
+                verified_advanced_urls = set(advanced_urls) if advanced and advanced.get("search_status") == "completed" else set()
+                for url in advanced_urls:
+                    row = profiles.setdefault(url, {"url": url, "status": "pending", "job_codes": []})
+                    sources = row.setdefault("advanced_search_job_codes", [])
+                    if code in sources:
+                        sources.remove(code)
+                    if url in verified_advanced_urls:
+                        sources.append(code)
+                persist()
+
+                print(
+                    f"Job {code}: Part 1 processing {len(advanced_urls)} Advanced Search candidates (save + quick tag)...",
+                    flush=True,
+                )
+                await process_candidate_profiles(
+                    api, args, profile_page, applicant_page, job, advanced_urls, profiles, persist
+                )
+
+            if advanced and advanced.get("search_status") == "completed":
+                advanced["status"] = "completed" if all(
+                    profiles.get(url, {}).get("status") in FINAL for url in advanced_urls
+                ) else "processing"
+
+            saved_job["advanced_pipeline_status"] = "completed"
+            history[code] = saved_job
+            api.save_state(history_path, history)
+
+        if phase == 1:
+            return
+
+    # -------------------------------------------------------------
+    # PART 2: Normal Search & Profile Save Pipeline (after Part 1)
+    # -------------------------------------------------------------
+    advanced = saved_job.get("advanced_search") or {}
+    advanced_urls = list(dict.fromkeys(advanced.get("profiles", [])))[:20]
+    advanced_set = set(advanced_urls)
     location_searches = saved_job.setdefault("location_searches", [])
-    all_urls = list(advanced_urls)
-    for record in location_searches:
-        all_urls.extend(record.get("profiles", []))
-
     legacy_urls = saved_job.get("profiles", []) if not location_searches else []
-    if not args.search_only and legacy_urls:
-        all_urls.extend(legacy_urls)
-
     search_title = job.get("cleaned_title") or job["title"]
     search_only_urls = list(advanced_urls)
-    normal_filters = dict(title=search_title, skills=requirements["skills"],
-                          experience=requirements["experience"], version=1)
+    normal_filters = dict(title=search_title, version=2)
+    all_urls = list(advanced_urls)
     for pass_number, variant in enumerate(location_variants, start=1):
         record = next(
             (item for item in location_searches if item.get("pass") == pass_number),
@@ -3198,13 +3357,12 @@ async def process_job(api, args, linkedin, profile_page, applicant_page, job, pr
 
         if candidates is None:
             try:
+                print(f"Job {code}: next step - running normal search pass {pass_number} for {variant!r}...", flush=True)
                 await linkedin.goto(api.SEARCH_URL, wait_until="domcontentloaded")
                 await clear_search_filters(linkedin)
                 await api.apply_title(linkedin, search_title)
                 await api.apply_location(linkedin, variant)
-                if requirements["has_jd"]:
-                    await apply_jd_filters(linkedin, requirements)
-                await submit_search(linkedin, required=requirements["has_jd"])
+                await submit_search(linkedin, required=False)
                 await api.wait_for_search_results(linkedin)
                 candidates = await api.collect_profiles(linkedin, 30)
             except Exception as exc:
@@ -3245,11 +3403,13 @@ async def process_job(api, args, linkedin, profile_page, applicant_page, job, pr
 
         print(f"Job {code}: pass {pass_number} URLs stored; continuing to next location before profile extraction.", flush=True)
 
-    advanced_urls = list(dict.fromkeys(advanced_urls))[:10]
+    advanced_urls = list(dict.fromkeys(advanced_urls))[:20]
     advanced_set = set(advanced_urls)
     all_advanced_set = set((advanced or {}).get("profiles", [])) | advanced_set
     normal_urls = list(dict.fromkeys(url for url in all_urls if url not in all_advanced_set))
-    selected_normal = normal_urls[:30]
+    target_limit = getattr(args, "limit", 30) or 30
+    normal_needed = max(0, target_limit - len(advanced_urls))
+    selected_normal = normal_urls[:normal_needed]
     selected_urls = advanced_urls + selected_normal
     selected_set = set(selected_urls)
     saved_job["profile_sources"] = {
@@ -3259,15 +3419,16 @@ async def process_job(api, args, linkedin, profile_page, applicant_page, job, pr
     saved_job["profile_selection"] = {
         "advanced_search": advanced_urls,
         "normal_search": selected_normal,
-        "skipped_normal_limit": normal_urls[30:],
+        "skipped_normal_limit": normal_urls[normal_needed:],
         "skipped_advanced_limit": list(dict.fromkeys(
             url for url in (advanced or {}).get("profiles", []) if url not in advanced_set
         )),
-        "limits": {"advanced_search": 10, "normal_search": 30},
+        "limits": {"advanced_search": 20, "normal_search": normal_needed, "total": len(selected_urls)},
     }
     for record in location_searches:
         record["source"] = "normal_search"
         record["skipped_limit_profiles"] = [url for url in record.get("profiles", []) if url not in selected_set]
+        record["profiles"] = [url for url in record.get("profiles", []) if url in selected_set]
     if advanced:
         advanced["source"] = "advanced_search"
         advanced["skipped_limit_profiles"] = [
@@ -3298,9 +3459,14 @@ async def process_job(api, args, linkedin, profile_page, applicant_page, job, pr
         api.save_state(history_path, history)
         raise ValueError("No LinkedIn profiles found in any location search pass; job remains pending.")
 
-    print(f"Job {code}: all {len(location_variants)} location searches finished; processing {len(unique_urls)} unique profiles.", flush=True)
+    print(
+        f"Job {code}: searches finished; collected {len(unique_urls)} profiles total "
+        f"({len(advanced_urls)} from Advanced Search to tag, {len(selected_normal)} from Normal Search to save only).",
+        flush=True,
+    )
+    pending_urls = [url for url in unique_urls if profiles.get(url, {}).get("status") not in FINAL]
     verified_advanced_urls = set(advanced_urls) if advanced and advanced.get("search_status") == "completed" else set()
-    for url in unique_urls:
+    for url in pending_urls:
         row = profiles.setdefault(url, {"url": url, "status": "pending", "job_codes": []})
         sources = row.setdefault("advanced_search_job_codes", [])
         if code in sources:
@@ -3308,9 +3474,10 @@ async def process_job(api, args, linkedin, profile_page, applicant_page, job, pr
         if url in verified_advanced_urls:
             sources.append(code)
     persist()
-    await process_candidate_profiles(
-        api, args, profile_page, applicant_page, job, unique_urls, profiles, persist
-    )
+    if pending_urls:
+        await process_candidate_profiles(
+            api, args, profile_page, applicant_page, job, pending_urls, profiles, persist
+        )
     for record in location_searches:
         if record.get("search_status") != "completed":
             continue
@@ -3324,6 +3491,14 @@ async def process_job(api, args, linkedin, profile_page, applicant_page, job, pr
         advanced["status"] = "completed" if all(
             profiles.get(url, {}).get("status") in FINAL for url in advanced_urls
         ) else "processing"
+    if advanced and advanced.get("location_searches"):
+        for record in advanced["location_searches"]:
+            if record.get("search_status") != "completed":
+                continue
+            record["status"] = "completed" if all(
+                profiles.get(url, {}).get("status") in FINAL
+                for url in record.get("profiles", []) if url in selected_set
+            ) else "processing"
 
     completed_all = (
         (not advanced_required or (advanced and advanced.get("status") == "completed"))
