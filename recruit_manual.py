@@ -2432,6 +2432,75 @@ async def write_resume_pdf(context, html_doc, path):
     path.write_bytes(base64.b64decode(result["data"]))
 
 
+def sync_jobs_from_disk(job_path, jobs):
+    if not job_path.exists():
+        return
+    try:
+        disk_data = json.loads(job_path.read_text(encoding="utf-8"))
+        if isinstance(disk_data, dict):
+            for k, v in disk_data.items():
+                if k not in jobs:
+                    jobs[k] = v
+                elif isinstance(v, dict):
+                    for field, val in v.items():
+                        if field not in jobs[k] or val != jobs[k].get(field):
+                            jobs[k][field] = val
+    except Exception:
+        pass
+
+
+def get_pending_advanced_jobs(jobs, history, args):
+    pending = []
+    for code, cached in jobs.items():
+        if args.job_url and cached.get("url") != args.job_url:
+            continue
+        if cached.get("analysis_status") != "completed":
+            continue
+        if not args.search_only:
+            if cached.get("linkedin_processing") == "completed":
+                continue
+            if history.get(code, {}).get("status") == "completed":
+                continue
+        saved_job = history.get(code, {})
+        if saved_job.get("advanced_pipeline_status") in ("completed", "failed"):
+            continue
+        pending.append(cached)
+    pending.sort(key=lambda j: job_sort_key(j))
+    return pending
+
+
+def get_pending_normal_jobs(jobs, history, args):
+    pending = []
+    for code, cached in jobs.items():
+        if args.job_url and cached.get("url") != args.job_url:
+            continue
+        if cached.get("analysis_status") != "completed":
+            continue
+        saved_job = history.get(code, {})
+        if saved_job.get("advanced_pipeline_status") not in ("completed", "failed"):
+            continue
+        if args.search_only:
+            if saved_job.get("search_status") == "completed":
+                continue
+        else:
+            if cached.get("linkedin_processing") == "completed":
+                continue
+            if history.get(code, {}).get("status") == "completed":
+                continue
+        pending.append(cached)
+    pending.sort(key=lambda j: job_sort_key(j))
+    return pending
+
+
+def has_unready_jobs(jobs, args):
+    for code, cached in jobs.items():
+        if args.job_url and cached.get("url") != args.job_url:
+            continue
+        if cached.get("analysis_status") == "pending":
+            return True
+    return False
+
+
 async def produce_jobs(api, args, ceipal, jobs, history, job_path, queue, failures, queued_codes=None):
     collected_jobs = []
     queued_codes = queued_codes if queued_codes is not None else set()
@@ -2456,30 +2525,6 @@ async def produce_jobs(api, args, ceipal, jobs, history, job_path, queue, failur
                     continue
                 queue_ready_job(code, cached)
             await asyncio.sleep(0)
-            # Drain analyzed work before opening the job list or requesting new AI work.
-            while queued_codes:
-                print("Waiting for analyzed LinkedIn job queue to finish before new job discovery...", flush=True)
-                await queue.join()
-                if args.search_only:
-                    break
-                ready_pending = [
-                    (code, cached) for code, cached in list(jobs.items())
-                    if cached.get("analysis_status") == "completed"
-                    and cached.get("linkedin_processing") != "completed"
-                    and (not args.job_url or cached.get("url") == args.job_url)
-                ]
-                fresh = [(code, cached) for code, cached in ready_pending if code not in queued_codes]
-                if fresh:
-                    fresh.sort(key=lambda item: job_sort_key(item[1]))
-                    for code, cached in fresh:
-                        queue_ready_job(code, cached)
-                    continue
-                if ready_pending:
-                    print("Analyzed jobs remain pending; new job discovery deferred until they complete.", flush=True)
-                    failures.extend(code for code, _ in ready_pending if code not in failures)
-                    return
-                print("All analyzed LinkedIn jobs completed. Starting new job discovery/analysis.", flush=True)
-                break
         urls = [args.job_url] if args.job_url else await api.discover_jobs(ceipal, args.jobs_limit)
         metadata_by_url = getattr(api, "JOB_METADATA", {})
         urls.sort(key=lambda url: job_sort_key(
@@ -2502,6 +2547,8 @@ async def produce_jobs(api, args, ceipal, jobs, history, job_path, queue, failur
             })
             cached["job_index"] = normalize_job_index(cached.get("business_unit"))
             cached.setdefault("linkedin_processing", "pending")
+            cached.setdefault("analysis_status", "pending")
+            api.save_state(job_path, jobs)
             try:
                 if cached.get("analysis_status") != "completed":
                     await enrich_job_details(
@@ -2805,66 +2852,85 @@ async def run(api, args):
             applicant_page = await context.new_page()
 
             async def consume_jobs():
+                producer_finished = False
+
                 while True:
-                    job = await queue.get()
-                    if job is None:
-                        queue.task_done()
-                        return
-                    batch_jobs = [job]
+                    # 1. Drain notifications from queue
                     while not queue.empty():
                         try:
-                            next_job = queue.get_nowait()
-                            if next_job is None:
-                                break
-                            batch_jobs.append(next_job)
+                            item = queue.get_nowait()
+                            queue.task_done()
+                            if item is None:
+                                producer_finished = True
                         except asyncio.QueueEmpty:
                             break
 
-                    print(f"\n=======================================================", flush=True)
-                    print(f"🚀 PART 1: Running Advanced Search & Tag Pipeline for {len(batch_jobs)} job(s)...", flush=True)
-                    print(f"=======================================================\n", flush=True)
+                    # 2. Sync latest jobs from extract_job.json
+                    sync_jobs_from_disk(job_path, jobs)
 
-                    for current_job in batch_jobs:
-                        cached_job = jobs.get(current_job["code"], current_job)
-                        if not args.search_only:
-                            cached_job["linkedin_processing"] = "processing"
-                            cached_job["linkedin_started_at"] = datetime.now(timezone.utc).isoformat()
-                            api.save_state(job_path, jobs)
-                        print(
-                            f"Starting Part 1 (Advanced Search) for Job {current_job['code']} | business unit={current_job.get('business_unit')} | priority index={job_sort_key(current_job)[0]}",
-                            flush=True,
-                        )
-                        try:
-                            await process_job(
-                                api,
-                                args,
-                                linkedin,
-                                profile_page,
-                                applicant_page,
-                                current_job,
-                                profiles,
-                                history,
-                                history_path,
-                                persist,
-                                phase=1,
-                            )
-                        except Exception as exc:
-                            failures.append(current_job["code"])
+                    # 3. PRIORITY 1: ALWAYS check if ANY job in extract_job.json has pending Advanced Search!
+                    adv_jobs = get_pending_advanced_jobs(jobs, history, args)
+                    if adv_jobs:
+                        print(f"\n=======================================================", flush=True)
+                        print(f"🚀 Priority 1: Running Advanced Search & Tag for {len(adv_jobs)} pending job(s)...", flush=True)
+                        print(f"=======================================================\n", flush=True)
+
+                        for current_job in adv_jobs:
+                            cached_job = jobs.get(current_job["code"], current_job)
+                            if not args.search_only:
+                                cached_job["linkedin_processing"] = "processing"
+                                cached_job["linkedin_started_at"] = datetime.now(timezone.utc).isoformat()
+                                api.save_state(job_path, jobs)
                             print(
-                                f"Job {current_job['code']} Part 1 incomplete: {type(exc).__name__}: {exc}",
+                                f"Starting Part 1 (Advanced Search) for Job {current_job['code']} | business unit={current_job.get('business_unit')} | priority index={job_sort_key(current_job)[0]}",
                                 flush=True,
                             )
-                    print(f"\n=======================================================", flush=True)
-                    print(f"✅ PART 1 COMPLETED for all {len(batch_jobs)} job(s) till profile tagging.", flush=True)
-                    print(f"🚀 PART 2: Starting Normal Search & Profile Save for all jobs...", flush=True)
-                    print(f"=======================================================\n", flush=True)
+                            try:
+                                await process_job(
+                                    api,
+                                    args,
+                                    linkedin,
+                                    profile_page,
+                                    applicant_page,
+                                    current_job,
+                                    profiles,
+                                    history,
+                                    history_path,
+                                    persist,
+                                    phase=1,
+                                )
+                            except Exception as exc:
+                                failures.append(current_job["code"])
+                                saved_job = history.setdefault(current_job["code"], {})
+                                saved_job["advanced_pipeline_status"] = "failed"
+                                api.save_state(history_path, history)
+                                print(
+                                    f"Job {current_job['code']} Part 1 incomplete: {type(exc).__name__}: {exc}",
+                                    flush=True,
+                                )
 
-                    # Part 2: Normal Search for all jobs and save profiles
-                    for current_job in batch_jobs:
-                        print(
-                            f"Starting Part 2 (Normal Search) for Job {current_job['code']}...",
-                            flush=True,
-                        )
+                        print(f"\n✅ Advanced search batch completed. Re-checking all jobs before starting/continuing Normal Search...\n", flush=True)
+                        continue
+
+                    # 4. If any job is currently being analyzed in Ceipal, wait so we can run Advanced Search first
+                    if has_unready_jobs(jobs, args) and not producer_finished:
+                        try:
+                            item = await asyncio.wait_for(queue.get(), timeout=2.0)
+                            queue.task_done()
+                            if item is None:
+                                producer_finished = True
+                        except asyncio.TimeoutError:
+                            pass
+                        continue
+
+                    # 5. PRIORITY 2: Only run Normal Search when ALL jobs have completed Advanced Search!
+                    norm_jobs = get_pending_normal_jobs(jobs, history, args)
+                    if norm_jobs:
+                        current_job = norm_jobs[0]
+                        print(f"\n=======================================================", flush=True)
+                        print(f"🚀 Priority 2: Running Normal Search for Job {current_job['code']} ({len(norm_jobs)} remaining; all advance searches done)...", flush=True)
+                        print(f"=======================================================\n", flush=True)
+
                         try:
                             await process_job(
                                 api,
@@ -2897,7 +2963,25 @@ async def run(api, args):
                                     f"Job {current_job['code']}: history checked; LinkedIn {cached_job['linkedin_processing']}.",
                                     flush=True,
                                 )
-                            queue.task_done()
+
+                        # Loop back to top to verify if any new jobs arrived needing advance search!
+                        continue
+
+                    # 6. If neither adv_jobs nor norm_jobs are pending:
+                    if producer_finished:
+                        print(f"\n=======================================================", flush=True)
+                        print(f"✅ All jobs have completed both Advanced and Normal search pipelines.", flush=True)
+                        print(f"=======================================================\n", flush=True)
+                        break
+
+                    # Producer is still discovering. Wait for next job notification.
+                    try:
+                        item = await asyncio.wait_for(queue.get(), timeout=2.0)
+                        queue.task_done()
+                        if item is None:
+                            producer_finished = True
+                    except asyncio.TimeoutError:
+                        pass
 
             # Default full run keeps watching after a batch; scoped/test modes exit.
             watch_jobs = not args.search_only and not args.job_url
