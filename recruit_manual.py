@@ -44,7 +44,7 @@ JOB_INDEX_PRIORITY = {
 }
 
 PARSE_RESUME_SELECTOR = "#parse_resume"
-PARSE_TIMEOUT_S = 180
+PARSE_TIMEOUT_S = 40  # 4 attempts of 10s max wait for form confirmation before skipping to next profile
 PROFILE_EXTRACTION_VERSION = 11
 
 
@@ -1642,20 +1642,33 @@ async def create_applicant(page, row, api, persist, job_code=None):
         await upload.set_input_files(str(path))
         progress("Resume selected. Opening applicant fields...")
 
-        confirm = page.locator(api.existing.CEIPAL_CONFIRM_SELECTOR).first
+        confirm = page.locator(
+            f"{api.existing.CEIPAL_CONFIRM_SELECTOR}, "
+            "#confirmation button, "
+            ".modal:visible button.confirm, "
+            "button:has-text('Confirm'):visible, "
+            "button:has-text('Proceed'):visible, "
+            ".swal2-confirm:visible"
+        ).first
         progress("Waiting for editable applicant form; parser-result classification disabled.")
 
         parsed = page.locator(api.existing.CEIPAL_PARSED_FORM_SELECTOR)
         duplicate = page.locator(api.existing.CEIPAL_DUPLICATE_MODAL_SELECTOR)
         deadline = time.time() + PARSE_TIMEOUT_S
         last_parse_progress = time.time()
+        parse_wait_attempts = 0
         confirmation_clicked = False
 
         while time.time() < deadline:
-            if not confirmation_clicked and await confirm.count() and await confirm.is_visible():
-                await confirm.click()
-                confirmation_clicked = True
-                progress("Accepted resume upload confirmation.")
+            if await confirm.count() and await confirm.is_visible():
+                try:
+                    await confirm.click()
+                    if not confirmation_clicked:
+                        progress("Accepted resume upload confirmation.")
+                        confirmation_clicked = True
+                except Exception:
+                    pass
+
             if await duplicate.count() and await duplicate.is_visible():
                 row["status"] = "duplicate"
                 row["public_url"] = db_url
@@ -1684,12 +1697,18 @@ async def create_applicant(page, row, api, persist, job_code=None):
                 break
 
             if time.time() - last_parse_progress >= 10:
-                progress("Still waiting for applicant form or Save control...")
+                parse_wait_attempts += 1
                 last_parse_progress = time.time()
+                progress(f"Still waiting for applicant form or Save control (attempt {parse_wait_attempts}/4)...")
+                if parse_wait_attempts >= 4:
+                    progress("Applicant form/confirm not ready after 4 attempts of 10s (40s total). Skipping to next profile...")
+                    cleanup_resume_file()
+                    raise TimeoutError("Applicant form / confirm not ready after 4 attempts of 10s (40s total); skipping to next profile")
 
             await asyncio.sleep(1)
         else:
-            raise TimeoutError("Editable applicant controls were not found; uploaded PDF retained for retry")
+            cleanup_resume_file()
+            raise TimeoutError("Editable applicant controls were not found after 4 attempts (40s); skipping to next profile")
 
         progress("Parsed form ready; filling dummy email/mobile only when blank.")
         if not row.get("dummy_email"):
@@ -1809,11 +1828,12 @@ async def create_applicant(page, row, api, persist, job_code=None):
             persist()
             progress(f"Resume parsing succeeded; later form/save step needs attention: {exc}. Resume retained; job not marked completed.")
             raise
+        cleanup_resume_file()
         row["status"] = "failed"
         row["error"] = str(exc)
         row["public_url"] = db_url
         persist()
-        progress(f"Upload/parsed-form detection needs retry: {exc}. PDF retained; no completed DB status written.")
+        progress(f"Upload/parsed-form detection failed: {exc}. Continuing to next profile...")
         raise
 
 def find_public_profile_url(text, name):
