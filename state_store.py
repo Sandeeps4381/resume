@@ -21,10 +21,10 @@ def read_json_object(path):
     return data
 
 
-def check_and_perform_daily_8am_est_cleanup(root_dir, jobs=None, profiles=None, history=None):
+def check_and_perform_daily_830am_est_cleanup(root_dir, jobs=None, profiles=None, history=None):
     """
     Daily delete all data of JSON files (extract_job.json, job_history.json, profile_data.json)
-    at 8:00 AM EST.
+    at 8:30 AM EST (America/New_York timezone).
     """
     import os
     from datetime import datetime, timezone, timedelta
@@ -37,10 +37,10 @@ def check_and_perform_daily_8am_est_cleanup(root_dir, jobs=None, profiles=None, 
         est_tz = timezone(timedelta(hours=-5))
 
     now_est = datetime.now(est_tz)
-    today_8am_est = now_est.replace(hour=8, minute=0, second=0, microsecond=0)
+    today_830am_est = now_est.replace(hour=8, minute=30, second=0, microsecond=0)
 
-    # Check if we have reached or passed 8:00 AM EST today
-    if now_est < today_8am_est:
+    # Check if we have reached or passed 8:30 AM EST today
+    if now_est < today_830am_est:
         return False
 
     today_str = now_est.date().isoformat()
@@ -58,8 +58,8 @@ def check_and_perform_daily_8am_est_cleanup(root_dir, jobs=None, profiles=None, 
         return False
 
     print(f"\n=======================================================", flush=True)
-    print(f"⏰ [8:00 AM EST DAILY CLEANUP TRIGGERED at {now_est.strftime('%Y-%m-%d %H:%M:%S %Z')}]", flush=True)
-    print("Deleting all data of extract_job.json, job_history.json, and profile_data.json...", flush=True)
+    print(f"⏰ [8:30 AM EST DAILY CLEANUP TRIGGERED at {now_est.strftime('%Y-%m-%d %H:%M:%S %Z')}]", flush=True)
+    print("Deleting all previous date data (extract_job.json, job_history.json, profile_data.json, and resumes)...", flush=True)
 
     job_path = Path(root_dir) / "extract_job.json"
     profile_path = Path(root_dir) / "profile_data.json"
@@ -97,7 +97,12 @@ def check_and_perform_daily_8am_est_cleanup(root_dir, jobs=None, profiles=None, 
     except Exception as exc:
         print(f"Could not write cleanup marker file: {exc}", flush=True)
 
-    print("✅ Daily 8:00 AM EST cleanup completed successfully. State files reset to empty.", flush=True)
+    print("✅ Daily 8:30 AM EST cleanup completed successfully. State files reset to empty.", flush=True)
     print(f"=======================================================\n", flush=True)
     return True
+
+
+# Backward compatibility alias
+check_and_perform_daily_8am_est_cleanup = check_and_perform_daily_830am_est_cleanup
+
 

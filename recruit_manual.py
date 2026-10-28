@@ -2664,7 +2664,7 @@ def has_unready_jobs(jobs, args):
     return False
 
 
-async def produce_jobs(api, args, ceipal, jobs, history, job_path, queue, failures, queued_codes=None):
+async def produce_jobs(api, args, ceipal, jobs, history, job_path, queue, failures, queued_codes=None, ceipal_lock=None):
     collected_jobs = []
     queued_codes = queued_codes if queued_codes is not None else set()
 
@@ -2688,67 +2688,75 @@ async def produce_jobs(api, args, ceipal, jobs, history, job_path, queue, failur
                     continue
                 queue_ready_job(code, cached)
             await asyncio.sleep(0)
-        urls = [args.job_url] if args.job_url else await api.discover_jobs(ceipal, args.jobs_limit)
-        metadata_by_url = getattr(api, "JOB_METADATA", {})
-        urls.sort(key=lambda url: job_sort_key(
-            metadata_by_url.get(url) or jobs.get(api.job_code_for(url), {})
-        ))
-        for url in urls:
-            code = api.job_code_for(url)
-            if code in queued_codes:
-                continue
-            if not args.search_only and history.get(code, {}).get("status") == "completed":
-                print(f"Job {code} already completed; skipping.", flush=True)
-                continue
-            metadata = getattr(api, "JOB_METADATA", {}).get(url, {})
-            created_val = metadata.get("job_created") or metadata.get("date_posted") or ""
-            cached = jobs.setdefault(code, {
-                "url": url, "code": code,
-                "title": metadata.get("title", ""),
-                "location": metadata.get("location", ""),
-                "business_unit": metadata.get("business_unit", ""),
-                "date_posted": json_safe(created_val),
-                "job_created": json_safe(metadata.get("job_created") or created_val),
-            })
-            if created_val:
-                cached["date_posted"] = json_safe(created_val)
-                if metadata.get("job_created"):
-                    cached["job_created"] = json_safe(metadata.get("job_created"))
-            cached["job_index"] = normalize_job_index(cached.get("business_unit"))
-            cached.setdefault("linkedin_processing", "pending")
-            cached.setdefault("analysis_status", "pending")
-            try:
-                api.save_state(job_path, jobs)
-            except Exception as e:
-                print(f"Warning: could not save job state: {e}", flush=True)
-            try:
-                if cached.get("analysis_status") != "completed":
-                    await enrich_job_details(
-                        api, ceipal, cached, lambda: api.save_state(job_path, jobs)
-                    )
+
+        async def _discover_and_enrich():
+            urls = [args.job_url] if args.job_url else await api.discover_jobs(ceipal, args.jobs_limit)
+            metadata_by_url = getattr(api, "JOB_METADATA", {})
+            urls.sort(key=lambda url: job_sort_key(
+                metadata_by_url.get(url) or jobs.get(api.job_code_for(url), {})
+            ))
+            for url in urls:
+                code = api.job_code_for(url)
+                if code in queued_codes:
+                    continue
+                if not args.search_only and history.get(code, {}).get("status") == "completed":
+                    print(f"Job {code} already completed; skipping.", flush=True)
+                    continue
+                metadata = getattr(api, "JOB_METADATA", {}).get(url, {})
+                created_val = metadata.get("job_created") or metadata.get("date_posted") or ""
+                cached = jobs.setdefault(code, {
+                    "url": url, "code": code,
+                    "title": metadata.get("title", ""),
+                    "location": metadata.get("location", ""),
+                    "business_unit": metadata.get("business_unit", ""),
+                    "date_posted": json_safe(created_val),
+                    "job_created": json_safe(metadata.get("job_created") or created_val),
+                })
+                if created_val:
+                    cached["date_posted"] = json_safe(created_val)
+                    if metadata.get("job_created"):
+                        cached["job_created"] = json_safe(metadata.get("job_created"))
+                cached["job_index"] = normalize_job_index(cached.get("business_unit"))
+                cached.setdefault("linkedin_processing", "pending")
+                cached.setdefault("analysis_status", "pending")
+                try:
                     api.save_state(job_path, jobs)
-                else:
-                    print(f"Using analyzed cached job: {code}", flush=True)
-                if cached.get("analysis_status") == "completed":
-                    queue_ready_job(code, cached)
-                    await asyncio.sleep(0)
-            except Exception as exc:
-                if is_browser_closed_error(exc):
-                    cached.setdefault("analysis_status", "pending")
+                except Exception as e:
+                    print(f"Warning: could not save job state: {e}", flush=True)
+                try:
+                    if cached.get("analysis_status") != "completed":
+                        await enrich_job_details(
+                            api, ceipal, cached, lambda: api.save_state(job_path, jobs)
+                        )
+                        api.save_state(job_path, jobs)
+                    else:
+                        print(f"Using analyzed cached job: {code}", flush=True)
+                    if cached.get("analysis_status") == "completed":
+                        queue_ready_job(code, cached)
+                        await asyncio.sleep(0)
+                except Exception as exc:
+                    if is_browser_closed_error(exc):
+                        cached.setdefault("analysis_status", "pending")
+                        try:
+                            api.save_state(job_path, jobs)
+                        except Exception:
+                            pass
+                        print(f"Browser closed suddenly during Ceipal enrichment for Job {code}; state kept pending.", flush=True)
+                        raise
+                    cached["analysis_status"] = "failed"
+                    cached["analysis_error"] = str(exc)
                     try:
                         api.save_state(job_path, jobs)
                     except Exception:
                         pass
-                    print(f"Browser closed suddenly during Ceipal enrichment for Job {code}; state kept pending.", flush=True)
-                    raise
-                cached["analysis_status"] = "failed"
-                cached["analysis_error"] = str(exc)
-                try:
-                    api.save_state(job_path, jobs)
-                except Exception:
-                    pass
-                failures.append(code)
-                print(f"Job {code}: {type(exc).__name__}: {exc}; raw data retained; continuing.", flush=True)
+                    failures.append(code)
+                    print(f"Job {code}: {type(exc).__name__}: {exc}; raw data retained; continuing.", flush=True)
+
+        if ceipal_lock is not None:
+            async with ceipal_lock:
+                await _discover_and_enrich()
+        else:
+            await _discover_and_enrich()
     finally:
         queue.put_nowait(None)
         print(f"Job collection finished: {len(collected_jobs)} analyzed jobs queued.", flush=True)
@@ -2937,8 +2945,8 @@ async def upload_pending_resumes(api, args, page, jobs, profiles, persist):
             continue
 
 async def run(api, args):
-    from state_store import check_and_perform_daily_8am_est_cleanup
-    check_and_perform_daily_8am_est_cleanup(api.ROOT)
+    from state_store import check_and_perform_daily_830am_est_cleanup
+    check_and_perform_daily_830am_est_cleanup(api.ROOT)
     job_path = api.ROOT / "extract_job.json"
     profile_path = api.ROOT / "profile_data.json"
     history_path = api.ROOT / "job_history.json"
@@ -3058,10 +3066,126 @@ async def run(api, args):
                     profile_page = await context.new_page()
                     applicant_page = await context.new_page()
 
+                    ceipal_lock = asyncio.Lock()
+                    last_30m_check_time = time.time()
+
+                    def check_time_and_log_30min():
+                        nonlocal last_30m_check_time
+                        now = time.time()
+                        if now - last_30m_check_time >= 1800:
+                            last_30m_check_time = now
+                            try:
+                                from zoneinfo import ZoneInfo
+                                est_tz = ZoneInfo("America/New_York")
+                            except Exception:
+                                est_tz = timezone(timedelta(hours=-5))
+                            now_est = datetime.now(est_tz)
+                            print(f"\n🕒 [30-Minute Time Check at {now_est.strftime('%Y-%m-%d %I:%M:%S %p %Z')}]", flush=True)
+                            is_today_mode = getattr(api, "is_after_daily_830am_est", lambda: False)()
+                            if is_today_mode:
+                                print("  Current mode: Post-8:30 AM EST -> Harvesting Today's current date data only.", flush=True)
+                            else:
+                                print("  Current mode: Pre-8:30 AM EST -> Active/Open jobs mode (waiting for 8:30 AM EST cutoff).", flush=True)
+
+                    async def check_ceipal_for_new_jobs():
+                        if args.jobs_only or args.job_url:
+                            return False
+                        async with ceipal_lock:
+                            if check_and_perform_daily_830am_est_cleanup(api.ROOT, jobs, profiles, history):
+                                print("⏰ [8:30 AM EST Daily Cleanup] State files reset to empty. Current date data will be gathered.", flush=True)
+
+                            print("\n🔍 Checking Ceipal job list page for new jobs...", flush=True)
+                            try:
+                                urls = await api.discover_jobs(ceipal, args.jobs_limit)
+                                metadata_by_url = getattr(api, "JOB_METADATA", {})
+                                new_urls = []
+                                for url in urls:
+                                    code = api.job_code_for(url)
+                                    if not args.search_only and history.get(code, {}).get("status") == "completed":
+                                        continue
+                                    if code in failures:
+                                        continue
+                                    cached = jobs.get(code)
+                                    if cached is None or cached.get("analysis_status") != "completed":
+                                        new_urls.append(url)
+
+                                if not new_urls:
+                                    print("🔍 [Ceipal Job List Check] No new jobs found on job list page.", flush=True)
+                                    return False
+
+                                print(f"\n=======================================================", flush=True)
+                                print(f"✨ [Ceipal Job List Check] Found {len(new_urls)} new job(s) on job list page: {[api.job_code_for(u) for u in new_urls]}", flush=True)
+                                print(f"🚀 Enriching and prioritizing new job(s) immediately...", flush=True)
+                                print(f"=======================================================\n", flush=True)
+
+                                new_urls.sort(key=lambda url: job_sort_key(
+                                    metadata_by_url.get(url) or jobs.get(api.job_code_for(url), {})
+                                ))
+
+                                added_any = False
+                                for url in new_urls:
+                                    code = api.job_code_for(url)
+                                    metadata = getattr(api, "JOB_METADATA", {}).get(url, {})
+                                    created_val = metadata.get("job_created") or metadata.get("date_posted") or ""
+                                    cached = jobs.setdefault(code, {
+                                        "url": url, "code": code,
+                                        "title": metadata.get("title", ""),
+                                        "location": metadata.get("location", ""),
+                                        "business_unit": metadata.get("business_unit", ""),
+                                        "date_posted": json_safe(created_val),
+                                        "job_created": json_safe(metadata.get("job_created") or created_val),
+                                    })
+                                    if created_val:
+                                        cached["date_posted"] = json_safe(created_val)
+                                        if metadata.get("job_created"):
+                                            cached["job_created"] = json_safe(metadata.get("job_created"))
+                                    cached["job_index"] = normalize_job_index(cached.get("business_unit"))
+                                    cached.setdefault("linkedin_processing", "pending")
+                                    cached.setdefault("analysis_status", "pending")
+                                    api.save_state(job_path, jobs)
+
+                                    try:
+                                        if cached.get("analysis_status") != "completed":
+                                            await enrich_job_details(api, ceipal, cached, lambda: api.save_state(job_path, jobs))
+                                            cached["analysis_status"] = "completed"
+                                            api.save_state(job_path, jobs)
+                                        print(f"🎯 New job {code} enriched successfully. Ready for Priority 1 Advanced Search.", flush=True)
+                                        added_any = True
+                                    except Exception as exc:
+                                        if is_browser_closed_error(exc):
+                                            cached.setdefault("analysis_status", "pending")
+                                            try:
+                                                api.save_state(job_path, jobs)
+                                            except Exception:
+                                                pass
+                                            raise
+                                        cached["analysis_status"] = "failed"
+                                        cached["analysis_error"] = str(exc)
+                                        try:
+                                            api.save_state(job_path, jobs)
+                                        except Exception:
+                                            pass
+                                        failures.append(code)
+                                        print(f"⚠️ Failed to enrich new job {code}: {exc}", flush=True)
+
+                                return added_any
+                            except Exception as exc:
+                                if is_browser_closed_error(exc):
+                                    raise
+                                print(f"Notice: Failed to check Ceipal job list for new jobs: {exc}", flush=True)
+                                return False
+
                     async def consume_jobs():
                         producer_finished = False
 
                         while True:
+                            check_time_and_log_30min()
+                            if check_and_perform_daily_830am_est_cleanup(api.ROOT, jobs, profiles, history):
+                                print("⏰ [8:30 AM EST Daily Cleanup] Fired! Resetting state to empty. Starting fresh discovery of today's jobs...", flush=True)
+                                if not args.jobs_only and not args.job_url:
+                                    await check_ceipal_for_new_jobs()
+                                continue
+
                             # 1. Drain notifications from queue
                             while not queue.empty():
                                 try:
@@ -3082,6 +3206,7 @@ async def run(api, args):
                                 print(f"🚀 Priority 1: Running Advanced Search & Tag for {len(adv_jobs)} pending job(s)...", flush=True)
                                 print(f"=======================================================\n", flush=True)
 
+                                interrupted_by_new_job = False
                                 for current_job in adv_jobs:
                                     cached_job = jobs.get(current_job["code"], current_job)
                                     if not args.search_only:
@@ -3125,6 +3250,17 @@ async def run(api, args):
                                             flush=True,
                                         )
 
+                                    # After each job process completes, check job list page for new jobs!
+                                    if not args.jobs_only and not args.job_url and producer_finished:
+                                        found_new = await check_ceipal_for_new_jobs()
+                                        if found_new:
+                                            print(f"✨ New job(s) found on Ceipal job list page! Prioritizing new job...", flush=True)
+                                            interrupted_by_new_job = True
+                                            break
+
+                                if interrupted_by_new_job:
+                                    continue
+
                                 print(f"\n✅ Advanced search batch completed. Re-checking all jobs before starting/continuing Normal Search...\n", flush=True)
                                 continue
 
@@ -3139,7 +3275,14 @@ async def run(api, args):
                                     pass
                                 continue
 
-                            # 5. PRIORITY 2: Only run Normal Search when ALL jobs have completed Advanced Search!
+                            # Check Ceipal job list page before Normal Search starts: if new job found, work on it first; else start normal search
+                            if not args.jobs_only and not args.job_url and producer_finished:
+                                found_new = await check_ceipal_for_new_jobs()
+                                if found_new:
+                                    print("✨ New job(s) discovered on Ceipal job list page before Normal Search! Running Advanced Search first...", flush=True)
+                                    continue
+
+                            # 5. PRIORITY 2: Only run Normal Search when ALL jobs have completed Advanced Search and no new jobs on Ceipal!
                             norm_jobs = get_pending_normal_jobs(jobs, history, args, exclude_codes=failures)
                             if norm_jobs:
                                 current_job = norm_jobs[0]
@@ -3193,6 +3336,14 @@ async def run(api, args):
                                             flush=True,
                                         )
 
+                                # After Normal Search job completes its process, check Ceipal job list page for new jobs!
+                                if not args.jobs_only and not args.job_url and producer_finished:
+                                    found_new = await check_ceipal_for_new_jobs()
+                                    if found_new:
+                                        print(f"✨ New job(s) found on Ceipal after completing Normal Search for {current_job['code']}! Prioritizing new job...", flush=True)
+                                    else:
+                                        print(f"🔍 Checked Ceipal job list: No new jobs found. Continuing normal search...", flush=True)
+
                                 # Loop back to top to verify if any new jobs arrived needing advance search!
                                 continue
 
@@ -3219,7 +3370,8 @@ async def run(api, args):
                     async def sleep_with_daily_cleanup_check(seconds, step=5):
                         end_time = time.time() + seconds
                         while time.time() < end_time:
-                            if check_and_perform_daily_8am_est_cleanup(api.ROOT, jobs, profiles, history):
+                            check_time_and_log_30min()
+                            if check_and_perform_daily_830am_est_cleanup(api.ROOT, jobs, profiles, history):
                                 return True
                             try:
                                 if not context.pages or context.pages[0].is_closed():
@@ -3233,7 +3385,7 @@ async def run(api, args):
 
                     while True:
                         round_number += 1
-                        check_and_perform_daily_8am_est_cleanup(api.ROOT, jobs, profiles, history)
+                        check_and_perform_daily_830am_est_cleanup(api.ROOT, jobs, profiles, history)
                         if round_number > 1:
                             queue = asyncio.Queue()
                             startup_codes = set()
@@ -3241,7 +3393,8 @@ async def run(api, args):
                             print("Refreshing Ceipal job list for the next discovery pass...", flush=True)
                             try:
                                 # open_job_list navigates afresh to /JobPosts/index, resetting pagination.
-                                await api.open_job_list(ceipal)
+                                async with ceipal_lock:
+                                    await api.open_job_list(ceipal)
                             except Exception as exc:
                                 if is_browser_closed_error(exc):
                                     print(f"\nBrowser closed during Ceipal refresh: {exc}. Progress kept pending. Relaunching...", flush=True)
@@ -3251,7 +3404,7 @@ async def run(api, args):
                                 continue
                         consumer = asyncio.create_task(consume_jobs())
                         producer = asyncio.create_task(
-                            produce_jobs(api, args, ceipal, jobs, history, job_path, queue, failures, startup_codes)
+                            produce_jobs(api, args, ceipal, jobs, history, job_path, queue, failures, startup_codes, ceipal_lock=ceipal_lock)
                         )
                         try:
                             await asyncio.gather(producer, consumer)
@@ -3283,8 +3436,8 @@ async def run(api, args):
                             print("Discovery errors; checking job list again in 30 seconds. Ctrl+C to stop.", flush=True)
                             await sleep_with_daily_cleanup_check(30)
                         elif not startup_codes:
-                            print("No new jobs; checking job list again in 10 minutes. Ctrl+C to stop.", flush=True)
-                            await sleep_with_daily_cleanup_check(600)
+                            print("No new jobs; checking job list again in 30 minutes. Ctrl+C to stop.", flush=True)
+                            await sleep_with_daily_cleanup_check(1800)
                         else:
                             print("All queued jobs completed; refreshing the job list now. Ctrl+C to stop.", flush=True)
                 finally:

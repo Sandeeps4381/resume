@@ -166,16 +166,19 @@ async def linkedin_2fa(page):
     print("LinkedIn authenticator code submitted locally.", flush=True)
 
 
-def is_after_daily_8am_est():
-    """Check if current time is at or after 8:00 AM EST (New York time)."""
+def is_after_daily_830am_est():
+    """Check if current time is at or after 8:30 AM EST (New York time)."""
     try:
         from zoneinfo import ZoneInfo
         est_tz = ZoneInfo("America/New_York")
     except Exception:
         est_tz = timezone(timedelta(hours=-5))
     now_est = datetime.now(est_tz)
-    today_8am_est = now_est.replace(hour=8, minute=0, second=0, microsecond=0)
-    return now_est >= today_8am_est
+    today_830am_est = now_est.replace(hour=8, minute=30, second=0, microsecond=0)
+    return now_est >= today_830am_est
+
+
+is_after_daily_8am_est = is_after_daily_830am_est
 
 
 def is_job_created_today(text):
@@ -218,9 +221,9 @@ def is_job_created_today(text):
 
 
 async def apply_today_job_filter(page):
-    """Apply 'Today' date filter on the 'Job Created' column in Ceipal JobPosts table only after 8:00 AM EST."""
-    if not is_after_daily_8am_est():
-        print("Before 8:00 AM EST: keeping all Active/Open jobs without 'Today' date filter.", flush=True)
+    """Apply 'Today' date filter on the 'Job Created' column in Ceipal JobPosts table only after 8:30 AM EST."""
+    if not is_after_daily_830am_est():
+        print("Before 8:30 AM EST: keeping all Active/Open jobs without 'Today' date filter.", flush=True)
         return
     try:
         if "/JobPosts" not in page.url:
@@ -808,8 +811,8 @@ async def discover_jobs(page, limit):
                 job_created = ""
                 if job_created_column is not None and job_created_column < len(cells):
                     job_created = cells[job_created_column].strip()
-                    if is_after_daily_8am_est() and job_created and not is_job_created_today(job_created):
-                        print(f"  [After 8 AM EST] skipping job {title!r}: created {job_created!r}, not today.", flush=True)
+                    if is_after_daily_830am_est() and job_created and not is_job_created_today(job_created):
+                        print(f"  [After 8:30 AM EST] skipping job {title!r}: created {job_created!r}, not today.", flush=True)
                         continue
 
                 location = ""
@@ -1220,8 +1223,8 @@ def main():
     job_path = ROOT / "extract_job.json"
     profile_path = ROOT / "profile_data.json"
     history_path = ROOT / "job_history.json"
-    from state_store import check_and_perform_daily_8am_est_cleanup
-    check_and_perform_daily_8am_est_cleanup(ROOT)
+    from state_store import check_and_perform_daily_830am_est_cleanup
+    check_and_perform_daily_830am_est_cleanup(ROOT)
     cleanup_old_job_data(job_path, profile_path, history_path)
 
     try:
