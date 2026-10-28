@@ -20,6 +20,7 @@ import re
 import urllib.request
 from urllib.parse import urlsplit, urlunsplit
 from datetime import datetime, timezone, timedelta
+import uuid
 
 from playwright.async_api import async_playwright
 from azure_title import clean_job_location
@@ -53,6 +54,44 @@ async def visible(page, selectors, timeout=30):
                 return item
         await asyncio.sleep(.5)
     raise RuntimeError("Control not found: " + ", ".join(selectors))
+
+
+def is_browser_closed_error(exc):
+    if exc is None:
+        return False
+    chain = [exc]
+    if getattr(exc, "__cause__", None):
+        chain.append(exc.__cause__)
+    if getattr(exc, "__context__", None):
+        chain.append(exc.__context__)
+    for e in chain:
+        exc_type = type(e).__name__
+        msg = str(e).lower()
+        if exc_type in ("TargetClosedError", "BrowserClosedError"):
+            return True
+        closed_keywords = (
+            "target page, context or browser has been closed",
+            "target closed",
+            "browser has been closed",
+            "browser closed",
+            "context closed",
+            "page has been closed",
+            "connection closed",
+            "session closed",
+            "process singleton lock",
+            "user data directory is already in use",
+            "browser process has been closed",
+            "has been closed",
+            "disconnected",
+            "connection reset",
+            "connection refused",
+            "target crashed",
+            "protocol error",
+            "browser has disconnected",
+        )
+        if any(keyword in msg for keyword in closed_keywords):
+            return True
+    return False
 
 
 async def login(page, ceipal=False):
@@ -833,6 +872,66 @@ def canonical_url(url):
     return urlunsplit((parts.scheme, parts.netloc.lower(), parts.path.rstrip("/"), "", ""))
 
 
+LINKEDIN_LIMIT_CHECK_JS = r"""() => {
+  const text = (document.body ? document.body.innerText : '').toLowerCase();
+  const limitPatterns = [
+    'commercial use limit',
+    'monthly limit for profile searches',
+    'reached your monthly limit',
+    'reached the monthly limit',
+    'reached your search limit',
+    'reached the search limit',
+    'search limit reached',
+    'search limit has been reached',
+    'profile search limit',
+    'profile view limit',
+    'view limit reached',
+    'profile limit reached',
+    'limit of profile views',
+    'reached the limit for profile searches',
+    'reached the limit of profile views',
+    'maximum number of profile searches',
+    'maximum number of profile views',
+    'upgrade to view more profiles',
+    'upgrade your plan to view more',
+    'upgrade to recruiter',
+    'out of profile views',
+    'out of search limit',
+    "you’ve reached the limit",
+    "you've reached the limit",
+    "you’ve reached your limit",
+    "you've reached your limit",
+    "you have reached your limit",
+    'temporarily restricted',
+    '0 profile views remaining',
+    '0 search views remaining',
+    '0 searches remaining'
+  ];
+  for (const pattern of limitPatterns) {
+    if (text.includes(pattern)) {
+      return pattern;
+    }
+  }
+  const banner = document.querySelector(
+    '.search-paywall, .commercial-use-limit, [data-test-search-limit-warning], .artdeco-banner--error, [data-test-commercial-use-limit], .search-results__paywall'
+  );
+  if (banner && (banner.innerText || '').trim()) {
+    const bannerText = (banner.innerText || '').trim();
+    if (/limit|upgrade|reached|quota/i.test(bannerText)) {
+      return bannerText.slice(0, 100);
+    }
+  }
+  return null;
+}"""
+
+
+async def check_linkedin_limit_reached(page):
+    try:
+        return await page.evaluate(LINKEDIN_LIMIT_CHECK_JS)
+    except Exception:
+        return None
+
+
 async def wait_for_search_results(page):
     print("Waiting for LinkedIn search results to finish loading...", flush=True)
     await asyncio.sleep(random.uniform(3, 5))
@@ -1061,13 +1160,31 @@ async def collect_profiles(page, limit):
         print(f"Opening result page {page_number + 1}.", flush=True)
         await asyncio.sleep(random.uniform(3, 5))
         await page.evaluate("window.scrollTo(0, 0)")
+    if not urls:
+        limit_reason = await check_linkedin_limit_reached(page)
+        if limit_reason:
+            print(f"⚠️ LinkedIn search/profile view limit detected: {limit_reason}", flush=True)
     return urls[:limit]
 
 
 def save_state(path, state):
-    temp = path.with_suffix(".tmp")
-    temp.write_text(json.dumps(state, indent=2), encoding="utf-8")
-    temp.replace(path)
+    data = json.dumps(state, indent=2)
+    temp = path.with_suffix(f".tmp_{os.getpid()}_{uuid.uuid4().hex[:8]}")
+    for attempt in range(10):
+        try:
+            temp.write_text(data, encoding="utf-8")
+            temp.replace(path)
+            return
+        except (PermissionError, OSError):
+            time.sleep(0.05 * (attempt + 1))
+    try:
+        path.write_text(data, encoding="utf-8")
+    finally:
+        if temp.exists():
+            try:
+                temp.unlink()
+            except Exception:
+                pass
 
 
 def main():

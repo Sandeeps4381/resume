@@ -4,6 +4,44 @@ import asyncio
 import re
 
 
+def is_browser_closed_error(exc):
+    if exc is None:
+        return False
+    chain = [exc]
+    if getattr(exc, "__cause__", None):
+        chain.append(exc.__cause__)
+    if getattr(exc, "__context__", None):
+        chain.append(exc.__context__)
+    for e in chain:
+        exc_type = type(e).__name__
+        msg = str(e).lower()
+        if exc_type in ("TargetClosedError", "BrowserClosedError"):
+            return True
+        closed_keywords = (
+            "target page, context or browser has been closed",
+            "target closed",
+            "browser has been closed",
+            "browser closed",
+            "context closed",
+            "page has been closed",
+            "connection closed",
+            "session closed",
+            "process singleton lock",
+            "user data directory is already in use",
+            "browser process has been closed",
+            "has been closed",
+            "disconnected",
+            "connection reset",
+            "connection refused",
+            "target crashed",
+            "protocol error",
+            "browser has disconnected",
+        )
+        if any(keyword in msg for keyword in closed_keywords):
+            return True
+    return False
+
+
 def advanced_search_enabled():
     """Advance toggles the extra JD-first pass; default preserves existing behavior."""
     value = os.getenv("Advance", "true").strip().lower()
@@ -351,7 +389,19 @@ async def run_advanced_search(api, args, linkedin, code, locations, requirements
                     await api.wait_for_search_results(linkedin)
                     needed = max(1, 20 - len(all_advanced_candidates)) if not args.search_only else 20
                     candidates = (await api.collect_profiles(linkedin, needed))[:needed]
+                    if not candidates:
+                        limit_fn = getattr(api, "check_linkedin_limit_reached", None)
+                        limit_reason = await limit_fn(linkedin) if limit_fn else None
+                        if limit_reason:
+                            print(f"⚠️ Job {code}: LinkedIn profile view / search limit detected on Advanced Search pass {pass_number}: {limit_reason!r}", flush=True)
+                            saved_job["limit_reached"] = True
+                            saved_job["limit_reason"] = limit_reason
+                            advanced["limit_reached"] = True
+                            advanced["limit_reason"] = limit_reason
                 except Exception as exc:
+                    if is_browser_closed_error(exc):
+                        print(f"Job {code}: Browser closed suddenly during Advanced Search pass {pass_number}; leaving pending.", flush=True)
+                        raise
                     if record is None:
                         record = {"pass": pass_number, "location": variant, "profiles": []}
                         adv_location_searches.append(record)
@@ -371,14 +421,17 @@ async def run_advanced_search(api, args, linkedin, code, locations, requirements
             record.pop("error", None)
             record["location"] = variant
             record["profiles"] = needed_candidates
-            record["search_status"] = "completed"
-            record["status"] = "collected"
+            record["search_status"] = "limit_reached" if advanced.get("limit_reached") and not needed_candidates else "completed"
+            record["status"] = "pending" if advanced.get("limit_reached") and not needed_candidates else "collected"
             all_advanced_candidates.extend(needed_candidates)
             persist_history()
             print(f"Job {code}: Advanced Search pass {pass_number} using {variant!r} returned {len(needed_candidates)} profile(s) (total: {len(all_advanced_candidates)}/20).", flush=True)
 
         advanced_urls = list(dict.fromkeys(all_advanced_candidates))[:20]
-        if any(r.get("search_status") == "completed" for r in adv_location_searches):
+        if advanced.get("limit_reached") and not advanced_urls:
+            advanced.update(profiles=[], search_status="limit_reached", status="pending")
+            print(f"⚠️ Job {code}: Advanced Search hit LinkedIn limit; keeping status pending.", flush=True)
+        elif any(r.get("search_status") == "completed" for r in adv_location_searches):
             advanced.update(profiles=advanced_urls, search_status="completed", status="collected")
             print(f"Job {code}: Advanced Search location pass(es) finished; {len(advanced_urls)} profile(s) collected (max 20).", flush=True)
         else:

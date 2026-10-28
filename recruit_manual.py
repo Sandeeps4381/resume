@@ -48,6 +48,104 @@ PARSE_TIMEOUT_S = 180
 PROFILE_EXTRACTION_VERSION = 11
 
 
+def is_browser_closed_error(exc):
+    if exc is None:
+        return False
+    chain = [exc]
+    if getattr(exc, "__cause__", None):
+        chain.append(exc.__cause__)
+    if getattr(exc, "__context__", None):
+        chain.append(exc.__context__)
+    for e in chain:
+        exc_type = type(e).__name__
+        msg = str(e).lower()
+        if exc_type in ("TargetClosedError", "BrowserClosedError"):
+            return True
+        closed_keywords = (
+            "target page, context or browser has been closed",
+            "target closed",
+            "browser has been closed",
+            "browser closed",
+            "context closed",
+            "page has been closed",
+            "connection closed",
+            "session closed",
+            "process singleton lock",
+            "user data directory is already in use",
+            "browser process has been closed",
+            "has been closed",
+            "disconnected",
+            "connection reset",
+            "connection refused",
+            "target crashed",
+            "protocol error",
+            "browser has disconnected",
+        )
+        if any(keyword in msg for keyword in closed_keywords):
+            return True
+    return False
+
+
+LINKEDIN_LIMIT_CHECK_JS = r"""() => {
+  const text = (document.body ? document.body.innerText : '').toLowerCase();
+  const limitPatterns = [
+    'commercial use limit',
+    'monthly limit for profile searches',
+    'reached your monthly limit',
+    'reached the monthly limit',
+    'reached your search limit',
+    'reached the search limit',
+    'search limit reached',
+    'search limit has been reached',
+    'profile search limit',
+    'profile view limit',
+    'view limit reached',
+    'profile limit reached',
+    'limit of profile views',
+    'reached the limit for profile searches',
+    'reached the limit of profile views',
+    'maximum number of profile searches',
+    'maximum number of profile views',
+    'upgrade to view more profiles',
+    'upgrade your plan to view more',
+    'upgrade to recruiter',
+    'out of profile views',
+    'out of search limit',
+    "you’ve reached the limit",
+    "you've reached the limit",
+    "you’ve reached your limit",
+    "you've reached your limit",
+    "you have reached your limit",
+    'temporarily restricted',
+    '0 profile views remaining',
+    '0 search views remaining',
+    '0 searches remaining'
+  ];
+  for (const pattern of limitPatterns) {
+    if (text.includes(pattern)) {
+      return pattern;
+    }
+  }
+  const banner = document.querySelector(
+    '.search-paywall, .commercial-use-limit, [data-test-search-limit-warning], .artdeco-banner--error, [data-test-commercial-use-limit], .search-results__paywall'
+  );
+  if (banner && (banner.innerText || '').trim()) {
+    const bannerText = (banner.innerText || '').trim();
+    if (/limit|upgrade|reached|quota/i.test(bannerText)) {
+      return bannerText.slice(0, 100);
+    }
+  }
+  return null;
+}"""
+
+
+async def check_linkedin_limit_reached(page):
+    try:
+        return await page.evaluate(LINKEDIN_LIMIT_CHECK_JS)
+    except Exception:
+        return None
+
+
 def is_applicant_snapshot(url):
     return bool(
         re.match(
@@ -76,10 +174,14 @@ def json_safe(value):
 
 
 def save_state_json(path, data):
-    path.write_text(
-        json.dumps(json_safe(data), ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    payload = json.dumps(json_safe(data), ensure_ascii=False, indent=2)
+    for attempt in range(5):
+        try:
+            path.write_text(payload, encoding="utf-8")
+            return
+        except (PermissionError, OSError):
+            time.sleep(0.05 * (attempt + 1))
+    path.write_text(payload, encoding="utf-8")
 
 
 def db_connect():
@@ -1831,6 +1933,9 @@ async def read_profile_text(page, url, job_code=None):
     await page.goto(url, wait_until="domcontentloaded", timeout=90000)
     if any(marker in page.url for marker in ("/login", "/authwall", "/checkpoint")):
         raise RuntimeError("LinkedIn profile requires login/verification.")
+    limit_reason = await check_linkedin_limit_reached(page)
+    if limit_reason:
+        raise RuntimeError(f"LinkedIn profile view limit reached: {limit_reason}")
     override = os.getenv("LINKEDIN_PROFILE_CONTENT_SELECTOR")
     content = page.locator(override or 'main, [role="main"]').first
     await content.wait_for(state="visible", timeout=30000)
@@ -2435,22 +2540,30 @@ async def write_resume_pdf(context, html_doc, path):
 def sync_jobs_from_disk(job_path, jobs):
     if not job_path.exists():
         return
-    try:
-        disk_data = json.loads(job_path.read_text(encoding="utf-8"))
-        if isinstance(disk_data, dict):
-            for k, v in disk_data.items():
-                if k not in jobs:
-                    jobs[k] = v
-                elif isinstance(v, dict):
-                    for field, val in v.items():
-                        if field not in jobs[k] or val != jobs[k].get(field):
-                            jobs[k][field] = val
-    except Exception:
-        pass
+    for _ in range(5):
+        try:
+            text = job_path.read_text(encoding="utf-8")
+            if not text.strip():
+                return
+            disk_data = json.loads(text)
+            if isinstance(disk_data, dict):
+                for k, v in disk_data.items():
+                    if k not in jobs:
+                        jobs[k] = v
+                    elif isinstance(v, dict):
+                        for field, val in v.items():
+                            if field not in jobs[k] or val != jobs[k].get(field):
+                                jobs[k][field] = val
+            break
+        except (PermissionError, OSError, json.JSONDecodeError):
+            time.sleep(0.05)
+        except Exception:
+            break
 
 
-def get_pending_advanced_jobs(jobs, history, args):
+def get_pending_advanced_jobs(jobs, history, args, exclude_codes=None):
     pending = []
+    failed_pending = []
     for code, cached in jobs.items():
         if args.job_url and cached.get("url") != args.job_url:
             continue
@@ -2464,13 +2577,18 @@ def get_pending_advanced_jobs(jobs, history, args):
         saved_job = history.get(code, {})
         if saved_job.get("advanced_pipeline_status") in ("completed", "failed"):
             continue
-        pending.append(cached)
+        if exclude_codes and code in exclude_codes:
+            failed_pending.append(cached)
+        else:
+            pending.append(cached)
     pending.sort(key=lambda j: job_sort_key(j))
-    return pending
+    failed_pending.sort(key=lambda j: job_sort_key(j))
+    return pending if pending else failed_pending
 
 
-def get_pending_normal_jobs(jobs, history, args):
+def get_pending_normal_jobs(jobs, history, args, exclude_codes=None):
     pending = []
+    failed_pending = []
     for code, cached in jobs.items():
         if args.job_url and cached.get("url") != args.job_url:
             continue
@@ -2487,9 +2605,13 @@ def get_pending_normal_jobs(jobs, history, args):
                 continue
             if history.get(code, {}).get("status") == "completed":
                 continue
-        pending.append(cached)
+        if exclude_codes and code in exclude_codes:
+            failed_pending.append(cached)
+        else:
+            pending.append(cached)
     pending.sort(key=lambda j: job_sort_key(j))
-    return pending
+    failed_pending.sort(key=lambda j: job_sort_key(j))
+    return pending if pending else failed_pending
 
 
 def has_unready_jobs(jobs, args):
@@ -2548,7 +2670,10 @@ async def produce_jobs(api, args, ceipal, jobs, history, job_path, queue, failur
             cached["job_index"] = normalize_job_index(cached.get("business_unit"))
             cached.setdefault("linkedin_processing", "pending")
             cached.setdefault("analysis_status", "pending")
-            api.save_state(job_path, jobs)
+            try:
+                api.save_state(job_path, jobs)
+            except Exception as e:
+                print(f"Warning: could not save job state: {e}", flush=True)
             try:
                 if cached.get("analysis_status") != "completed":
                     await enrich_job_details(
@@ -2561,9 +2686,20 @@ async def produce_jobs(api, args, ceipal, jobs, history, job_path, queue, failur
                     queue_ready_job(code, cached)
                     await asyncio.sleep(0)
             except Exception as exc:
+                if is_browser_closed_error(exc):
+                    cached.setdefault("analysis_status", "pending")
+                    try:
+                        api.save_state(job_path, jobs)
+                    except Exception:
+                        pass
+                    print(f"Browser closed suddenly during Ceipal enrichment for Job {code}; state kept pending.", flush=True)
+                    raise
                 cached["analysis_status"] = "failed"
                 cached["analysis_error"] = str(exc)
-                api.save_state(job_path, jobs)
+                try:
+                    api.save_state(job_path, jobs)
+                except Exception:
+                    pass
                 failures.append(code)
                 print(f"Job {code}: {type(exc).__name__}: {exc}; raw data retained; continuing.", flush=True)
     finally:
@@ -2741,6 +2877,9 @@ async def upload_pending_resumes(api, args, page, jobs, profiles, persist):
             row.pop("error", None)
             persist()
         except Exception as exc:
+            if is_browser_closed_error(exc):
+                print(f"Browser closed suddenly during pending PDF upload for {url}; status kept pending.", flush=True)
+                raise
             # A confirmed save must not become a retry/skip after a tracking error.
             if row.get("status") in {"saved", "duplicate", "skipped_db_exists"}:
                 row["error"] = str(exc)
@@ -2756,297 +2895,367 @@ async def run(api, args):
     job_path = api.ROOT / "extract_job.json"
     profile_path = api.ROOT / "profile_data.json"
     history_path = api.ROOT / "job_history.json"
-    jobs = read_store(job_path)
-    profiles = read_store(profile_path)
-    history = read_store(history_path)
+    restart_count = 0
+    while True:
+        jobs = read_store(job_path)
+        profiles = read_store(profile_path)
+        history = read_store(history_path)
 
+        for code, job in jobs.items():
+            job["job_index"] = normalize_job_index(job.get("business_unit") or job.get("job_index"))
+            # Clean cached search data locally; completed analyses never need another AI call.
+            from location_utils import clean_location
+            job["location"] = clean_location(job.get("location", ""))
+            job["location_variants"] = api.generate_location_variants(
+                job["location"], job.get("business_unit", "")
+            )
+            for field in ("city", "state", "country"):
+                if field in job:
+                    job[field] = clean_location(job[field])
+            if isinstance(job.get("location_details"), dict):
+                for field, value in job["location_details"].items():
+                    job["location_details"][field] = clean_location(value)
+            if history.get(code, {}).get("status") == "completed":
+                job["linkedin_processing"] = "completed"
+            elif job.get("linkedin_processing") != "completed":
+                # Interrupted work resumes using the persisted profile/location history.
+                job["linkedin_processing"] = "pending"
+            if job.get("analysis_status") == "processing":
+                job["analysis_status"] = "pending"
+        api.save_state(job_path, jobs)
 
-    for code, job in jobs.items():
-        job["job_index"] = normalize_job_index(job.get("business_unit") or job.get("job_index"))
-        # Clean cached search data locally; completed analyses never need another AI call.
-        from location_utils import clean_location
-        job["location"] = clean_location(job.get("location", ""))
-        job["location_variants"] = api.generate_location_variants(
-            job["location"], job.get("business_unit", "")
-        )
-        for field in ("city", "state", "country"):
-            if field in job:
-                job[field] = clean_location(job[field])
-        if isinstance(job.get("location_details"), dict):
-            for field, value in job["location_details"].items():
-                job["location_details"][field] = clean_location(value)
-        if history.get(code, {}).get("status") == "completed":
-            job["linkedin_processing"] = "completed"
-        elif job.get("linkedin_processing") != "completed":
-            # Interrupted work resumes using the persisted profile/location history.
-            job["linkedin_processing"] = "pending"
-    api.save_state(job_path, jobs)
+        queue = asyncio.Queue()
+        startup_codes = set()
+        if not args.jobs_only:
+            for code, job in sorted(jobs.items(), key=lambda item: job_sort_key(item[1])):
+                if args.job_url and job.get("url") != args.job_url:
+                    continue
+                if job.get("analysis_status") != "completed":
+                    continue
+                if not args.search_only and job.get("linkedin_processing") == "completed":
+                    continue
+                job.setdefault("code", code)
+                queue.put_nowait(dict(job))
+                startup_codes.add(code)
+                print(f"Startup: analyzed job {code} ready; LinkedIn starts after login, without AI analysis.", flush=True)
 
-    queue = asyncio.Queue()
-    startup_codes = set()
-    if not args.jobs_only:
-        for code, job in sorted(jobs.items(), key=lambda item: job_sort_key(item[1])):
-            if args.job_url and job.get("url") != args.job_url:
-                continue
-            if job.get("analysis_status") != "completed":
-                continue
-            if not args.search_only and job.get("linkedin_processing") == "completed":
-                continue
-            job.setdefault("code", code)
-            queue.put_nowait(dict(job))
-            startup_codes.add(code)
-            print(f"Startup: analyzed job {code} ready; LinkedIn starts after login, without AI analysis.", flush=True)
+        for row in profiles.values():
+            if row.get("status") == "saving":
+                row["status"] = "review_required"
 
-    for row in profiles.values():
-        if row.get("status") == "saving":
-            row["status"] = "review_required"
+        def persist():
+            # Extracted candidate content stays in memory for PDF creation only.
+            tracking_fields = {
+                "url", "public_url", "status", "job_codes", "extraction_version",
+                "resume_path", "resume_deleted", "applicant_url", "tag_job_status", "tag_profile", "advanced_search_job_codes",
+                "city", "state", "country", "location", "location_source",
+                "location_validation", "city_location_validated",
+                "business_unit", "job_index", "job_title", "cleaned_job_title", "date_posted", "error",
+            }
+            tracking = {
+                url: {key: value for key, value in row.items() if key in tracking_fields}
+                for url, row in profiles.items()
+            }
+            api.save_state(profile_path, tracking)
 
-    def persist():
-        # Extracted candidate content stays in memory for PDF creation only.
-        tracking_fields = {
-            "url", "public_url", "status", "job_codes", "extraction_version",
-            "resume_path", "resume_deleted", "applicant_url", "tag_job_status", "tag_profile", "advanced_search_job_codes",
-            "city", "state", "country", "location", "location_source",
-            "location_validation", "city_location_validated",
-            "business_unit", "job_index", "job_title", "cleaned_job_title", "date_posted", "error",
-        }
-        tracking = {
-            url: {key: value for key, value in row.items() if key in tracking_fields}
-            for url, row in profiles.items()
-        }
-        api.save_state(profile_path, tracking)
+        persist()
 
-    persist()
-    async with api.async_playwright() as playwright:
-        context = await playwright.chromium.launch_persistent_context(
-            str(api.ROOT / "browser-data-recruit"),
-            headless=False,
-            accept_downloads=False,
-            viewport={"width": 1440, "height": 900},
-        )
-        context.set_default_timeout(30000)
         try:
-            ceipal = context.pages[0] if context.pages else await context.new_page()
-            if args.jobs_only:
-                await api.login(ceipal, True)
-                await ceipal.wait_for_function(
-                    "() => !/\\/pages\\/signin|\\/users\\/autologout/.test(location.pathname)",
-                    timeout=240000,
-                )
-                failures = []
-                await produce_jobs(api, args, ceipal, jobs, history, job_path, asyncio.Queue(), failures)
-                return 1 if failures else 0
-
-            linkedin = await context.new_page()
-            await asyncio.gather(api.login(ceipal, True), api.login(linkedin))
-            await api.wait_for_sites_ready(ceipal, linkedin)
-            failures = []
-
-            if not args.search_only:
-                retry_page = await context.new_page()
-                try:
-                    await upload_pending_resumes(api, args, retry_page, jobs, profiles, persist)
-                finally:
-                    await retry_page.close()
-            profile_page = await context.new_page()
-            applicant_page = await context.new_page()
-
-            async def consume_jobs():
-                producer_finished = False
-
-                while True:
-                    # 1. Drain notifications from queue
-                    while not queue.empty():
-                        try:
-                            item = queue.get_nowait()
-                            queue.task_done()
-                            if item is None:
-                                producer_finished = True
-                        except asyncio.QueueEmpty:
-                            break
-
-                    # 2. Sync latest jobs from extract_job.json
-                    sync_jobs_from_disk(job_path, jobs)
-
-                    # 3. PRIORITY 1: ALWAYS check if ANY job in extract_job.json has pending Advanced Search!
-                    adv_jobs = get_pending_advanced_jobs(jobs, history, args)
-                    if adv_jobs:
-                        print(f"\n=======================================================", flush=True)
-                        print(f"🚀 Priority 1: Running Advanced Search & Tag for {len(adv_jobs)} pending job(s)...", flush=True)
-                        print(f"=======================================================\n", flush=True)
-
-                        for current_job in adv_jobs:
-                            cached_job = jobs.get(current_job["code"], current_job)
-                            if not args.search_only:
-                                cached_job["linkedin_processing"] = "processing"
-                                cached_job["linkedin_started_at"] = datetime.now(timezone.utc).isoformat()
-                                api.save_state(job_path, jobs)
-                            print(
-                                f"Starting Part 1 (Advanced Search) for Job {current_job['code']} | business unit={current_job.get('business_unit')} | priority index={job_sort_key(current_job)[0]}",
-                                flush=True,
-                            )
-                            try:
-                                await process_job(
-                                    api,
-                                    args,
-                                    linkedin,
-                                    profile_page,
-                                    applicant_page,
-                                    current_job,
-                                    profiles,
-                                    history,
-                                    history_path,
-                                    persist,
-                                    phase=1,
-                                )
-                            except Exception as exc:
-                                failures.append(current_job["code"])
-                                saved_job = history.setdefault(current_job["code"], {})
-                                saved_job["advanced_pipeline_status"] = "failed"
-                                api.save_state(history_path, history)
-                                print(
-                                    f"Job {current_job['code']} Part 1 incomplete: {type(exc).__name__}: {exc}",
-                                    flush=True,
-                                )
-
-                        print(f"\n✅ Advanced search batch completed. Re-checking all jobs before starting/continuing Normal Search...\n", flush=True)
-                        continue
-
-                    # 4. If any job is currently being analyzed in Ceipal, wait so we can run Advanced Search first
-                    if has_unready_jobs(jobs, args) and not producer_finished:
-                        try:
-                            item = await asyncio.wait_for(queue.get(), timeout=2.0)
-                            queue.task_done()
-                            if item is None:
-                                producer_finished = True
-                        except asyncio.TimeoutError:
-                            pass
-                        continue
-
-                    # 5. PRIORITY 2: Only run Normal Search when ALL jobs have completed Advanced Search!
-                    norm_jobs = get_pending_normal_jobs(jobs, history, args)
-                    if norm_jobs:
-                        current_job = norm_jobs[0]
-                        print(f"\n=======================================================", flush=True)
-                        print(f"🚀 Priority 2: Running Normal Search for Job {current_job['code']} ({len(norm_jobs)} remaining; all advance searches done)...", flush=True)
-                        print(f"=======================================================\n", flush=True)
-
-                        try:
-                            await process_job(
-                                api,
-                                args,
-                                linkedin,
-                                profile_page,
-                                applicant_page,
-                                current_job,
-                                profiles,
-                                history,
-                                history_path,
-                                persist,
-                                phase=2,
-                            )
-                        except Exception as exc:
-                            failures.append(current_job["code"])
-                            print(
-                                f"Job {current_job['code']} Part 2 incomplete: {type(exc).__name__}: {exc}",
-                                flush=True,
-                            )
-                        finally:
-                            if not args.search_only:
-                                complete = history.get(current_job["code"], {}).get("status") == "completed"
-                                cached_job = jobs.get(current_job["code"], current_job)
-                                cached_job["linkedin_processing"] = "completed" if complete else "pending"
-                                if complete:
-                                    cached_job["linkedin_completed_at"] = datetime.now(timezone.utc).isoformat()
-                                api.save_state(job_path, jobs)
-                                print(
-                                    f"Job {current_job['code']}: history checked; LinkedIn {cached_job['linkedin_processing']}.",
-                                    flush=True,
-                                )
-
-                        # Loop back to top to verify if any new jobs arrived needing advance search!
-                        continue
-
-                    # 6. If neither adv_jobs nor norm_jobs are pending:
-                    if producer_finished:
-                        print(f"\n=======================================================", flush=True)
-                        print(f"✅ All jobs have completed both Advanced and Normal search pipelines.", flush=True)
-                        print(f"=======================================================\n", flush=True)
+            async with api.async_playwright() as playwright:
+                context = None
+                for attempt in range(1, 6):
+                    try:
+                        context = await playwright.chromium.launch_persistent_context(
+                            str(api.ROOT / "browser-data-recruit"),
+                            headless=False,
+                            accept_downloads=False,
+                            viewport={"width": 1440, "height": 900},
+                        )
                         break
-
-                    # Producer is still discovering. Wait for next job notification.
-                    try:
-                        item = await asyncio.wait_for(queue.get(), timeout=2.0)
-                        queue.task_done()
-                        if item is None:
-                            producer_finished = True
-                    except asyncio.TimeoutError:
-                        pass
-
-            # Default full run keeps watching after a batch; scoped/test modes exit.
-            watch_jobs = not args.search_only and not args.job_url
-            round_number = 0
-
-            async def sleep_with_daily_cleanup_check(seconds, step=5):
-                end_time = time.time() + seconds
-                while time.time() < end_time:
-                    if check_and_perform_daily_8am_est_cleanup(api.ROOT, jobs, profiles, history):
-                        return True
-                    await asyncio.sleep(min(step, max(0.1, end_time - time.time())))
-                return False
-
-            while True:
-                round_number += 1
-                check_and_perform_daily_8am_est_cleanup(api.ROOT, jobs, profiles, history)
-                if round_number > 1:
-                    queue = asyncio.Queue()
-                    startup_codes = set()
-                    failures.clear()
-                    print("Refreshing Ceipal job list for the next discovery pass...", flush=True)
-                    try:
-                        # open_job_list navigates afresh to /JobPosts/index, resetting pagination.
-                        await api.open_job_list(ceipal)
-                    except Exception as exc:
-                        print(f"Job list refresh failed: {exc}; retrying in 30 seconds.", flush=True)
-                        await sleep_with_daily_cleanup_check(30)
-                        continue
-                consumer = asyncio.create_task(consume_jobs())
-                producer = asyncio.create_task(
-                    produce_jobs(api, args, ceipal, jobs, history, job_path, queue, failures, startup_codes)
-                )
-                try:
-                    await asyncio.gather(producer, consumer)
-                except Exception as exc:
-                    if not watch_jobs:
+                    except Exception as launch_exc:
+                        if is_browser_closed_error(launch_exc) or "singleton" in str(launch_exc).lower() or "in use" in str(launch_exc).lower():
+                            print(f"Browser launch attempt {attempt}/5 failed ({launch_exc}); retrying in {attempt * 2}s...", flush=True)
+                            await asyncio.sleep(attempt * 2)
+                            continue
                         raise
-                    print(f"Discovery pass failed: {exc}; retrying after refresh.", flush=True)
+                if context is None:
+                    raise RuntimeError("Failed to launch browser persistent context after 5 attempts")
+
+                context.set_default_timeout(30000)
+                try:
+                    ceipal = context.pages[0] if context.pages else await context.new_page()
+                    if args.jobs_only:
+                        await api.login(ceipal, True)
+                        await ceipal.wait_for_function(
+                            "() => !/\\/pages\\/signin|\\/users\\/autologout/.test(location.pathname)",
+                            timeout=240000,
+                        )
+                        failures = []
+                        await produce_jobs(api, args, ceipal, jobs, history, job_path, asyncio.Queue(), failures)
+                        return 1 if failures else 0
+
+                    linkedin = await context.new_page()
+                    await asyncio.gather(api.login(ceipal, True), api.login(linkedin))
+                    await api.wait_for_sites_ready(ceipal, linkedin)
+                    failures = []
+
+                    if not args.search_only:
+                        retry_page = await context.new_page()
+                        try:
+                            await upload_pending_resumes(api, args, retry_page, jobs, profiles, persist)
+                        finally:
+                            try:
+                                await retry_page.close()
+                            except Exception:
+                                pass
+                    profile_page = await context.new_page()
+                    applicant_page = await context.new_page()
+
+                    async def consume_jobs():
+                        producer_finished = False
+
+                        while True:
+                            # 1. Drain notifications from queue
+                            while not queue.empty():
+                                try:
+                                    item = queue.get_nowait()
+                                    queue.task_done()
+                                    if item is None:
+                                        producer_finished = True
+                                except asyncio.QueueEmpty:
+                                    break
+
+                            # 2. Sync latest jobs from extract_job.json
+                            sync_jobs_from_disk(job_path, jobs)
+
+                            # 3. PRIORITY 1: ALWAYS check if ANY job in extract_job.json has pending Advanced Search!
+                            adv_jobs = get_pending_advanced_jobs(jobs, history, args, exclude_codes=failures)
+                            if adv_jobs:
+                                print(f"\n=======================================================", flush=True)
+                                print(f"🚀 Priority 1: Running Advanced Search & Tag for {len(adv_jobs)} pending job(s)...", flush=True)
+                                print(f"=======================================================\n", flush=True)
+
+                                for current_job in adv_jobs:
+                                    cached_job = jobs.get(current_job["code"], current_job)
+                                    if not args.search_only:
+                                        cached_job["linkedin_processing"] = "processing"
+                                        cached_job["linkedin_started_at"] = datetime.now(timezone.utc).isoformat()
+                                        api.save_state(job_path, jobs)
+                                    print(
+                                        f"Starting Part 1 (Advanced Search) for Job {current_job['code']} | business unit={current_job.get('business_unit')} | priority index={job_sort_key(current_job)[0]}",
+                                        flush=True,
+                                    )
+                                    try:
+                                        await process_job(
+                                            api,
+                                            args,
+                                            linkedin,
+                                            profile_page,
+                                            applicant_page,
+                                            current_job,
+                                            profiles,
+                                            history,
+                                            history_path,
+                                            persist,
+                                            phase=1,
+                                        )
+                                    except Exception as exc:
+                                        if is_browser_closed_error(exc):
+                                            print(f"Browser closed suddenly during Part 1 for Job {current_job['code']}; state kept pending.", flush=True)
+                                            cached_job = jobs.get(current_job["code"], current_job)
+                                            cached_job["linkedin_processing"] = "pending"
+                                            try:
+                                                api.save_state(job_path, jobs)
+                                            except Exception:
+                                                pass
+                                            raise
+                                        failures.append(current_job["code"])
+                                        saved_job = history.setdefault(current_job["code"], {})
+                                        saved_job["advanced_pipeline_status"] = "failed"
+                                        api.save_state(history_path, history)
+                                        print(
+                                            f"Job {current_job['code']} Part 1 incomplete: {type(exc).__name__}: {exc}",
+                                            flush=True,
+                                        )
+
+                                print(f"\n✅ Advanced search batch completed. Re-checking all jobs before starting/continuing Normal Search...\n", flush=True)
+                                continue
+
+                            # 4. If any job is currently being analyzed in Ceipal, wait so we can run Advanced Search first
+                            if has_unready_jobs(jobs, args) and not producer_finished:
+                                try:
+                                    item = await asyncio.wait_for(queue.get(), timeout=2.0)
+                                    queue.task_done()
+                                    if item is None:
+                                        producer_finished = True
+                                except asyncio.TimeoutError:
+                                    pass
+                                continue
+
+                            # 5. PRIORITY 2: Only run Normal Search when ALL jobs have completed Advanced Search!
+                            norm_jobs = get_pending_normal_jobs(jobs, history, args, exclude_codes=failures)
+                            if norm_jobs:
+                                current_job = norm_jobs[0]
+                                print(f"\n=======================================================", flush=True)
+                                print(f"🚀 Priority 2: Running Normal Search for Job {current_job['code']} ({len(norm_jobs)} remaining; all advance searches done)...", flush=True)
+                                print(f"=======================================================\n", flush=True)
+
+                                try:
+                                    await process_job(
+                                        api,
+                                        args,
+                                        linkedin,
+                                        profile_page,
+                                        applicant_page,
+                                        current_job,
+                                        profiles,
+                                        history,
+                                        history_path,
+                                        persist,
+                                        phase=2,
+                                    )
+                                except Exception as exc:
+                                    if is_browser_closed_error(exc):
+                                        print(f"Browser closed suddenly during Part 2 for Job {current_job['code']}; state kept pending.", flush=True)
+                                        cached_job = jobs.get(current_job["code"], current_job)
+                                        cached_job["linkedin_processing"] = "pending"
+                                        try:
+                                            api.save_state(job_path, jobs)
+                                        except Exception:
+                                            pass
+                                        raise
+                                    failures.append(current_job["code"])
+                                    print(
+                                        f"Job {current_job['code']} Part 2 incomplete: {type(exc).__name__}: {exc}",
+                                        flush=True,
+                                    )
+                                finally:
+                                    if not args.search_only:
+                                        complete = history.get(current_job["code"], {}).get("status") == "completed"
+                                        cached_job = jobs.get(current_job["code"], current_job)
+                                        cached_job["linkedin_processing"] = "completed" if complete else "pending"
+                                        if complete:
+                                            cached_job["linkedin_completed_at"] = datetime.now(timezone.utc).isoformat()
+                                        elif history.get(current_job["code"], {}).get("limit_reached"):
+                                            cached_job["linkedin_error"] = history.get(current_job["code"], {}).get("limit_reason")
+                                            if current_job["code"] not in failures:
+                                                failures.append(current_job["code"])
+                                        api.save_state(job_path, jobs)
+                                        print(
+                                            f"Job {current_job['code']}: history checked; LinkedIn {cached_job['linkedin_processing']}.",
+                                            flush=True,
+                                        )
+
+                                # Loop back to top to verify if any new jobs arrived needing advance search!
+                                continue
+
+                            # 6. If neither adv_jobs nor norm_jobs are pending:
+                            if producer_finished:
+                                print(f"\n=======================================================", flush=True)
+                                print(f"✅ All jobs have completed both Advanced and Normal search pipelines.", flush=True)
+                                print(f"=======================================================\n", flush=True)
+                                break
+
+                            # Producer is still discovering. Wait for next job notification.
+                            try:
+                                item = await asyncio.wait_for(queue.get(), timeout=2.0)
+                                queue.task_done()
+                                if item is None:
+                                    producer_finished = True
+                            except asyncio.TimeoutError:
+                                pass
+
+                    # Default full run keeps watching after a batch; scoped/test modes exit.
+                    watch_jobs = not args.search_only and not args.job_url
+                    round_number = 0
+
+                    async def sleep_with_daily_cleanup_check(seconds, step=5):
+                        end_time = time.time() + seconds
+                        while time.time() < end_time:
+                            if check_and_perform_daily_8am_est_cleanup(api.ROOT, jobs, profiles, history):
+                                return True
+                            try:
+                                if not context.pages or context.pages[0].is_closed():
+                                    raise RuntimeError("Target page, context or browser has been closed")
+                                _ = context.pages[0].url
+                            except Exception as e:
+                                if is_browser_closed_error(e):
+                                    raise
+                            await asyncio.sleep(min(step, max(0.1, end_time - time.time())))
+                        return False
+
+                    while True:
+                        round_number += 1
+                        check_and_perform_daily_8am_est_cleanup(api.ROOT, jobs, profiles, history)
+                        if round_number > 1:
+                            queue = asyncio.Queue()
+                            startup_codes = set()
+                            failures.clear()
+                            print("Refreshing Ceipal job list for the next discovery pass...", flush=True)
+                            try:
+                                # open_job_list navigates afresh to /JobPosts/index, resetting pagination.
+                                await api.open_job_list(ceipal)
+                            except Exception as exc:
+                                if is_browser_closed_error(exc):
+                                    print(f"\nBrowser closed during Ceipal refresh: {exc}. Progress kept pending. Relaunching...", flush=True)
+                                    raise
+                                print(f"Job list refresh failed: {exc}; retrying in 30 seconds.", flush=True)
+                                await sleep_with_daily_cleanup_check(30)
+                                continue
+                        consumer = asyncio.create_task(consume_jobs())
+                        producer = asyncio.create_task(
+                            produce_jobs(api, args, ceipal, jobs, history, job_path, queue, failures, startup_codes)
+                        )
+                        try:
+                            await asyncio.gather(producer, consumer)
+                        except Exception as exc:
+                            if is_browser_closed_error(exc):
+                                print(f"\nBrowser was closed suddenly: {exc}. All progress kept pending. Relaunching...", flush=True)
+                                raise
+                            if not watch_jobs:
+                                raise
+                            print(f"Discovery pass failed: {exc}; retrying after refresh.", flush=True)
+                        finally:
+                            for task in (producer, consumer):
+                                if not task.done():
+                                    task.cancel()
+                            await asyncio.gather(producer, consumer, return_exceptions=True)
+                            api.save_state(job_path, jobs)
+                        if not watch_jobs:
+                            return 1 if failures else 0
+                        incomplete = any(
+                            job.get("analysis_status") == "completed"
+                            and job.get("linkedin_processing") != "completed"
+                            and history.get(code, {}).get("status") != "completed"
+                            for code, job in jobs.items()
+                        )
+                        if incomplete:
+                            print("Batch has pending jobs; retrying pending work in 30 seconds.", flush=True)
+                            await sleep_with_daily_cleanup_check(30)
+                        elif failures:
+                            print("Discovery errors; checking job list again in 30 seconds. Ctrl+C to stop.", flush=True)
+                            await sleep_with_daily_cleanup_check(30)
+                        elif not startup_codes:
+                            print("No new jobs; checking job list again in 10 minutes. Ctrl+C to stop.", flush=True)
+                            await sleep_with_daily_cleanup_check(600)
+                        else:
+                            print("All queued jobs completed; refreshing the job list now. Ctrl+C to stop.", flush=True)
                 finally:
-                    for task in (producer, consumer):
-                        if not task.done():
-                            task.cancel()
-                    await asyncio.gather(producer, consumer, return_exceptions=True)
-                    api.save_state(job_path, jobs)
-                if not watch_jobs:
-                    return 1 if failures else 0
-                incomplete = any(
-                    job.get("analysis_status") == "completed"
-                    and job.get("linkedin_processing") != "completed"
-                    and history.get(code, {}).get("status") != "completed"
-                    for code, job in jobs.items()
-                )
-                if incomplete:
-                    print("Batch has pending jobs; retrying pending work in 30 seconds.", flush=True)
-                    await sleep_with_daily_cleanup_check(30)
-                elif failures:
-                    print("Discovery errors; checking job list again in 30 seconds. Ctrl+C to stop.", flush=True)
-                    await sleep_with_daily_cleanup_check(30)
-                elif not startup_codes:
-                    print("No new jobs; checking job list again in 10 minutes. Ctrl+C to stop.", flush=True)
-                    await sleep_with_daily_cleanup_check(600)
-                else:
-                    print("All queued jobs completed; refreshing the job list now. Ctrl+C to stop.", flush=True)
-        finally:
-            await context.close()
+                    try:
+                        await context.close()
+                    except Exception:
+                        pass
+        except Exception as exc:
+            if is_browser_closed_error(exc):
+                restart_count += 1
+                print(f"\n" + "=" * 70, flush=True)
+                print(f"⚠️ [Browser Closed Detected] {type(exc).__name__}: {exc}", flush=True)
+                print(f"🔄 [Browser Auto-Restart #{restart_count}] Relaunching browser in 5 seconds and resuming tasks...", flush=True)
+                print(f"🔄 Current state preserved as pending; no data lost.", flush=True)
+                print("=" * 70 + "\n", flush=True)
+                await asyncio.sleep(5)
+                continue
+            raise
 
 
 async def process_candidate_profiles(api, args, profile_page, applicant_page, job, urls, profiles, persist):
@@ -3065,6 +3274,9 @@ async def process_candidate_profiles(api, args, profile_page, applicant_page, jo
                     persist()
                     print(f"[Profile {row['url']}] Applicant result: {row.get('status')}", flush=True)
                 except Exception as exc:
+                    if is_browser_closed_error(exc):
+                        print(f"Browser closed suddenly during applicant creation for {row.get('url')}; leaving pending.", flush=True)
+                        raise
                     if row.get("status") in {"saved", "duplicate", "skipped_db_exists"}:
                         row["error"] = str(exc)
                         persist()
@@ -3080,10 +3292,22 @@ async def process_candidate_profiles(api, args, profile_page, applicant_page, jo
         )
         await ready.put(None)
         await worker
+    except Exception as exc:
+        if is_browser_closed_error(exc):
+            raise
+        if worker.done():
+            worker_exc = worker.exception()
+            if is_browser_closed_error(worker_exc):
+                raise worker_exc
+        raise
     finally:
         if not worker.done():
             worker.cancel()
-        await asyncio.gather(worker, return_exceptions=True)
+        results = await asyncio.gather(worker, return_exceptions=True)
+        for res in results:
+            if isinstance(res, Exception) and not isinstance(res, asyncio.CancelledError):
+                if is_browser_closed_error(res):
+                    raise res
     return all(profiles.get(url, {}).get("status") in FINAL for url in urls)
 
 
@@ -3298,6 +3522,11 @@ async def prepare_candidate_profiles(api, args, profile_page, applicant_page, jo
             print(f"    skipped India profile before data extraction: {url}", flush=True)
             continue
         except Exception as exc:
+            if is_browser_closed_error(exc):
+                print(f"Browser closed suddenly during profile preparation for {url}; status kept pending.", flush=True)
+                profiles[url] = row
+                persist()
+                raise
             profiles[url] = row
             if row.get("status") in {"saved", "duplicate", "skipped_db_exists"}:
                 row["error"] = str(exc)
@@ -3449,7 +3678,18 @@ async def process_job(api, args, linkedin, profile_page, applicant_page, job, pr
                 await submit_search(linkedin, required=False)
                 await api.wait_for_search_results(linkedin)
                 candidates = await api.collect_profiles(linkedin, 30)
+                if not candidates:
+                    limit_fn = getattr(api, "check_linkedin_limit_reached", None)
+                    limit_reason = await limit_fn(linkedin) if limit_fn else None
+                    if limit_reason:
+                        print(f"⚠️ Job {code}: LinkedIn profile view / search limit detected on pass {pass_number}: {limit_reason!r}", flush=True)
+                        saved_job["limit_reached"] = True
+                        saved_job["limit_reason"] = limit_reason
             except Exception as exc:
+                _is_closed = globals().get('is_browser_closed_error', lambda e: False)
+                if _is_closed(exc):
+                    print(f"Job {code}: Browser closed suddenly during title search pass {pass_number}; leaving pending.", flush=True)
+                    raise
                 if record is None:
                     record = {"pass": pass_number, "location": variant, "profiles": []}
                     location_searches.append(record)
@@ -3471,8 +3711,8 @@ async def process_job(api, args, linkedin, profile_page, applicant_page, job, pr
         record.pop("error", None)
         record["location"] = variant
         record["profiles"] = candidates
-        record["search_status"] = "completed"
-        record["status"] = "collected"
+        record["search_status"] = "limit_reached" if saved_job.get("limit_reached") and not candidates else "completed"
+        record["status"] = "pending" if saved_job.get("limit_reached") and not candidates else "collected"
         all_urls.extend(candidates)
         saved_job.update({
             "status": "pending",
@@ -3536,12 +3776,47 @@ async def process_job(api, args, linkedin, profile_page, applicant_page, job, pr
     saved_job["search_status"] = "completed"
     api.save_state(history_path, history)
     if not unique_urls:
+        limit_reason = saved_job.get("limit_reason") or (advanced or {}).get("limit_reason")
+        if not limit_reason:
+            try:
+                limit_fn = getattr(api, "check_linkedin_limit_reached", None)
+                if limit_fn:
+                    limit_reason = await limit_fn(linkedin)
+            except Exception:
+                limit_reason = None
+
+        if limit_reason:
+            print(f"\n=======================================================", flush=True)
+            print(f"⚠️ Job {code}: LinkedIn profile view / search limit reached: {limit_reason!r}!", flush=True)
+            print(f"DO NOT mark completed! Job {code} remains PENDING.", flush=True)
+            print(f"=======================================================\n", flush=True)
+            for record in location_searches:
+                record["status"] = "pending"
+            if advanced:
+                advanced["status"] = "pending"
+            saved_job["status"] = "pending"
+            saved_job["limit_reached"] = True
+            saved_job["limit_reason"] = limit_reason
+            saved_job["profiles"] = []
+            saved_job["location_search_variants"] = location_variants
+            history[code] = saved_job
+            api.save_state(history_path, history)
+            return
+
+        print(f"Job {code}: 0 LinkedIn profiles found across all searches. Marking job completed with 0 candidates.", flush=True)
         for record in location_searches:
-            record["status"] = "pending"
-        saved_job["status"] = "pending"
+            if record.get("search_status") == "completed":
+                record["status"] = "completed"
+        if advanced and advanced.get("search_status") == "completed":
+            advanced["status"] = "completed"
+        saved_job["status"] = "completed"
+        saved_job["completed_at"] = datetime.now(timezone.utc).isoformat()
+        saved_job["profiles"] = []
+        saved_job["location_search_variants"] = location_variants
         history[code] = saved_job
         api.save_state(history_path, history)
-        raise ValueError("No LinkedIn profiles found in any location search pass; job remains pending.")
+        update_job_processing_status(code, 1)
+        return
 
     print(
         f"Job {code}: searches finished; collected {len(unique_urls)} profiles total "
