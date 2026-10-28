@@ -248,6 +248,38 @@ def linkedin_public_url_exists(url, job_code=None):
         conn.close()
 
 
+def parse_job_created_date(value):
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    text = str(value).strip()
+    if not text:
+        return None
+    formats = (
+        "%m/%d/%y %H:%M:%S",
+        "%m/%d/%Y %H:%M:%S",
+        "%m/%d/%y %I:%M:%S %p",
+        "%m/%d/%Y %I:%M:%S %p",
+        "%m/%d/%y %H:%M",
+        "%m/%d/%Y %H:%M",
+        "%m/%d/%y",
+        "%m/%d/%Y",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d",
+    )
+    for fmt in formats:
+        try:
+            return datetime.strptime(text, fmt)
+        except Exception:
+            pass
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except Exception:
+        pass
+    return text
+
+
 def update_linkedin_havesting_status(
     url,
     job_code=None,
@@ -266,6 +298,15 @@ def update_linkedin_havesting_status(
     try:
         cur = conn.cursor()
         tag_val = 1 if tag_profile else 0
+
+        if date_posted is not None:
+            parsed_dt = parse_job_created_date(date_posted)
+            if isinstance(parsed_dt, datetime):
+                date_posted = parsed_dt.strftime("%Y-%m-%d %H:%M:%S")
+            elif parsed_dt:
+                date_posted = str(parsed_dt)
+        if not date_posted:
+            date_posted = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         def exec_sql(query_with_tag, params_with_tag, query_fallback, params_fallback):
             try:
@@ -1629,7 +1670,7 @@ async def create_applicant(page, row, api, persist, job_code=None):
                         1,
                         job_title=row.get("job_title"),
                         cleaned_job_title=row.get("cleaned_job_title"),
-                        date_posted=row.get("date_posted") or datetime.now(),
+                        date_posted=row.get("job_created") or row.get("date_posted") or datetime.now(),
                         tag_profile=0,
                     )
                     update_job_processing_status(job_code, 1)
@@ -1726,7 +1767,7 @@ async def create_applicant(page, row, api, persist, job_code=None):
                         1,
                         job_title=row.get("job_title"),
                         cleaned_job_title=row.get("cleaned_job_title"),
-                        date_posted=row.get("date_posted") or datetime.now(),
+                        date_posted=row.get("job_created") or row.get("date_posted") or datetime.now(),
                         tag_profile=tag_profile_val,
                     )
                     update_job_processing_status(job_code, 1)
@@ -1750,7 +1791,7 @@ async def create_applicant(page, row, api, persist, job_code=None):
                         1,
                         job_title=row.get("job_title"),
                         cleaned_job_title=row.get("cleaned_job_title"),
-                        date_posted=row.get("date_posted") or datetime.now(),
+                        date_posted=row.get("job_created") or row.get("date_posted") or datetime.now(),
                         tag_profile=0,
                     )
                     update_job_processing_status(job_code, 1)
@@ -2660,13 +2701,19 @@ async def produce_jobs(api, args, ceipal, jobs, history, job_path, queue, failur
                 print(f"Job {code} already completed; skipping.", flush=True)
                 continue
             metadata = getattr(api, "JOB_METADATA", {}).get(url, {})
+            created_val = metadata.get("job_created") or metadata.get("date_posted") or ""
             cached = jobs.setdefault(code, {
                 "url": url, "code": code,
                 "title": metadata.get("title", ""),
                 "location": metadata.get("location", ""),
                 "business_unit": metadata.get("business_unit", ""),
-                "date_posted": json_safe(metadata.get("date_posted")),
+                "date_posted": json_safe(created_val),
+                "job_created": json_safe(metadata.get("job_created") or created_val),
             })
+            if created_val:
+                cached["date_posted"] = json_safe(created_val)
+                if metadata.get("job_created"):
+                    cached["job_created"] = json_safe(metadata.get("job_created"))
             cached["job_index"] = normalize_job_index(cached.get("business_unit"))
             cached.setdefault("linkedin_processing", "pending")
             cached.setdefault("analysis_status", "pending")
@@ -2862,7 +2909,7 @@ async def upload_pending_resumes(api, args, page, jobs, profiles, persist):
                 raise RuntimeError("Pending PDF has no job code")
             code = codes[-1]
             job = jobs.get(code, {})
-            for key in ("business_unit", "job_index", "date_posted"):
+            for key in ("business_unit", "job_index", "date_posted", "job_created"):
                 if job.get(key) is not None:
                     row[key] = job[key]
             row["job_title"] = job.get("title") or row.get("job_title", "")
@@ -2950,7 +2997,7 @@ async def run(api, args):
                 "resume_path", "resume_deleted", "applicant_url", "tag_job_status", "tag_profile", "advanced_search_job_codes",
                 "city", "state", "country", "location", "location_source",
                 "location_validation", "city_location_validated",
-                "business_unit", "job_index", "job_title", "cleaned_job_title", "date_posted", "error",
+                "business_unit", "job_index", "job_title", "cleaned_job_title", "date_posted", "job_created", "error",
             }
             tracking = {
                 url: {key: value for key, value in row.items() if key in tracking_fields}
@@ -3326,8 +3373,9 @@ async def prepare_candidate_profiles(api, args, profile_page, applicant_page, jo
         row["business_unit"] = job.get("business_unit")
         row["job_index"] = job.get("job_index")
         row["job_title"] = job.get("title")
-        row["cleaned_job_title"] = job.get("cleaned_title", job.get("title"))
-        row["date_posted"] = json_safe(job.get("date_posted"))
+        created_val = job.get("job_created") or job.get("date_posted")
+        row["date_posted"] = json_safe(created_val)
+        row["job_created"] = json_safe(created_val)
         if job.get("title"):
             mappings = dict(row.get("title_mapping") or {})
             mappings[job["title"]] = row.get("cleaned_job_title")

@@ -166,6 +166,18 @@ async def linkedin_2fa(page):
     print("LinkedIn authenticator code submitted locally.", flush=True)
 
 
+def is_after_daily_8am_est():
+    """Check if current time is at or after 8:00 AM EST (New York time)."""
+    try:
+        from zoneinfo import ZoneInfo
+        est_tz = ZoneInfo("America/New_York")
+    except Exception:
+        est_tz = timezone(timedelta(hours=-5))
+    now_est = datetime.now(est_tz)
+    today_8am_est = now_est.replace(hour=8, minute=0, second=0, microsecond=0)
+    return now_est >= today_8am_est
+
+
 def is_job_created_today(text):
     if not text:
         return True
@@ -206,7 +218,10 @@ def is_job_created_today(text):
 
 
 async def apply_today_job_filter(page):
-    """Apply 'Today' date filter on the 'Job Created' column in Ceipal JobPosts table."""
+    """Apply 'Today' date filter on the 'Job Created' column in Ceipal JobPosts table only after 8:00 AM EST."""
+    if not is_after_daily_8am_est():
+        print("Before 8:00 AM EST: keeping all Active/Open jobs without 'Today' date filter.", flush=True)
+        return
     try:
         if "/JobPosts" not in page.url:
             return
@@ -793,8 +808,8 @@ async def discover_jobs(page, limit):
                 job_created = ""
                 if job_created_column is not None and job_created_column < len(cells):
                     job_created = cells[job_created_column].strip()
-                    if job_created and not is_job_created_today(job_created):
-                        print(f"  skipping job {title!r}: created {job_created!r}, not today.", flush=True)
+                    if is_after_daily_8am_est() and job_created and not is_job_created_today(job_created):
+                        print(f"  [After 8 AM EST] skipping job {title!r}: created {job_created!r}, not today.", flush=True)
                         continue
 
                 location = ""
@@ -827,12 +842,12 @@ async def discover_jobs(page, limit):
                     "location": location,
                     "code": code,
                     "business_unit": business_unit,
-                    "date_posted": date_posted,
+                    "date_posted": job_created or date_posted,
                     "job_created": job_created,
                 }
                 print(
                     f"  job found: code={job_code_for(url)!r} title={title!r} "
-                    f"location={location!r} business_unit={business_unit!r} date_posted={date_posted!r} job_created={job_created!r}",
+                    f"location={location!r} business_unit={business_unit!r} date_posted={JOB_METADATA[url]['date_posted']!r} job_created={job_created!r}",
                     flush=True,
                 )
 
@@ -847,7 +862,8 @@ async def discover_jobs(page, limit):
                 break
 
         if not jobs:
-            raise ValueError("No visible Active/Open jobs found in Ceipal")
+            print("No visible Active/Open jobs found in Ceipal.", flush=True)
+            return []
         return jobs
 
     await prompt("In Job Posts, filter to OPEN jobs and show all 25 rows, then press Enter.")
