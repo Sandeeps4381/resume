@@ -44,7 +44,7 @@ JOB_INDEX_PRIORITY = {
 }
 
 PARSE_RESUME_SELECTOR = "#parse_resume"
-PARSE_TIMEOUT_S = 40  # 4 attempts of 10s max wait for form confirmation before skipping to next profile
+PARSE_TIMEOUT_S = int(os.getenv("CEIPAL_PARSE_TIMEOUT_S", "60"))  # 6 attempts of 10s max wait for form confirmation before skipping to next profile
 PROFILE_EXTRACTION_VERSION = 11
 
 
@@ -1628,6 +1628,7 @@ async def create_applicant(page, row, api, persist, job_code=None):
             print(f"    failed to delete local resume {path}: {exc}", flush=True)
 
     parsed_successfully = False
+    dialog_handler = None
     try:
         progress("Opening Ceipal Add Applicant page...")
         await page.goto(
@@ -1639,17 +1640,85 @@ async def create_applicant(page, row, api, persist, job_code=None):
         progress(f"Waiting for resume upload control; PDF={path}")
         upload = page.locator(os.getenv("CEIPAL_PARSE_RESUME_SELECTOR", PARSE_RESUME_SELECTOR)).first
         await upload.wait_for(state="attached", timeout=60000)
+
+        # Handle native browser dialogs (confirm/alert) automatically if Ceipal triggers one
+        def handle_dialog(dialog):
+            progress(f"Native browser dialog detected: '{dialog.message}'. Accepting ('Yes')...")
+            asyncio.create_task(dialog.accept())
+
+        dialog_handler = handle_dialog
+        page.on("dialog", dialog_handler)
+
         await upload.set_input_files(str(path))
         progress("Resume selected. Opening applicant fields...")
 
-        confirm = page.locator(
-            f"{api.existing.CEIPAL_CONFIRM_SELECTOR}, "
-            "#confirmation button, "
-            ".modal:visible button.confirm, "
-            "button:has-text('Confirm'):visible, "
-            "button:has-text('Proceed'):visible, "
-            ".swal2-confirm:visible"
-        ).first
+        # Specific selectors for the "Yes" / Confirm popup that appears after uploading resume
+        confirm_selectors = [
+            # 1. Exact "Yes" buttons and links (case-insensitive in Playwright)
+            "button:has-text('Yes'):visible",
+            "a:has-text('Yes'):visible",
+            "input[type='button'][value*='Yes' i]:visible",
+            "input[type='submit'][value*='Yes' i]:visible",
+
+            # 2. Ceipal modal specific selectors
+            "#confirmation button:has-text('Yes'):visible",
+            "#confirmation a:has-text('Yes'):visible",
+            "#confirmation button.confirm:visible",
+            "#confirmation .btn-primary:visible",
+            "#confirmation button:has-text('Confirm'):visible",
+
+            # 3. Active/visible modal dialog buttons
+            ".modal.in button:has-text('Yes'):visible",
+            ".modal.show button:has-text('Yes'):visible",
+            ".modal:visible button:has-text('Yes')",
+            ".modal:visible a:has-text('Yes')",
+            ".modal:visible button.confirm",
+            ".modal:visible .btn-primary:not(.close)",
+            "[role='dialog']:visible button:has-text('Yes')",
+            "[role='dialog']:visible a:has-text('Yes')",
+            ".ui-dialog:visible button:has-text('Yes')",
+            ".ui-dialog-buttonset button:has-text('Yes')",
+
+            # 4. SweetAlert, Bootbox, and alert libraries
+            ".swal2-confirm:visible",
+            ".swal2-actions button:has-text('Yes'):visible",
+            ".swal-button--confirm:visible",
+            "button[data-bb-handler='confirm']:visible",
+            "button[data-bb-handler='success']:visible",
+            ".jconfirm-buttons button:has-text('Yes'):visible",
+
+            # 5. Generic Confirm / Proceed buttons
+            "button:has-text('Confirm'):visible",
+            "button:has-text('Proceed'):visible",
+            "button.confirm:visible",
+            f"{api.existing.CEIPAL_CONFIRM_SELECTOR}:visible",
+        ]
+
+        async def try_accept_confirmation():
+            for selector in confirm_selectors:
+                try:
+                    loc = page.locator(selector)
+                    count = await loc.count()
+                    for idx in range(count):
+                        item = loc.nth(idx)
+                        if not await item.is_visible():
+                            continue
+                        text = (await item.text_content() or await item.get_attribute("value") or "").strip().lower()
+                        classes = (await item.get_attribute("class") or "").lower()
+                        aria_label = (await item.get_attribute("aria-label") or "").lower()
+
+                        # Prevent clicking close, dismiss, cancel or "No" buttons
+                        if text in {"no", "cancel", "close", "×", "x", "dismiss"} or "close" in classes or "cancel" in classes or "close" in aria_label:
+                            continue
+
+                        progress(f"Clicking upload confirmation ('Yes') via: {selector} (text='{text}')...")
+                        await item.scroll_into_view_if_needed()
+                        await item.click(force=True, timeout=3000)
+                        return True
+                except Exception:
+                    continue
+            return False
+
         progress("Waiting for editable applicant form; parser-result classification disabled.")
 
         parsed = page.locator(api.existing.CEIPAL_PARSED_FORM_SELECTOR)
@@ -1660,14 +1729,10 @@ async def create_applicant(page, row, api, persist, job_code=None):
         confirmation_clicked = False
 
         while time.time() < deadline:
-            if await confirm.count() and await confirm.is_visible():
-                try:
-                    await confirm.click()
-                    if not confirmation_clicked:
-                        progress("Accepted resume upload confirmation.")
-                        confirmation_clicked = True
-                except Exception:
-                    pass
+            if await try_accept_confirmation():
+                if not confirmation_clicked:
+                    progress("Accepted resume upload confirmation ('Yes' clicked).")
+                    confirmation_clicked = True
 
             if await duplicate.count() and await duplicate.is_visible():
                 row["status"] = "duplicate"
@@ -1699,16 +1764,22 @@ async def create_applicant(page, row, api, persist, job_code=None):
             if time.time() - last_parse_progress >= 10:
                 parse_wait_attempts += 1
                 last_parse_progress = time.time()
-                progress(f"Still waiting for applicant form or Save control (attempt {parse_wait_attempts}/4)...")
-                if parse_wait_attempts >= 4:
-                    progress("Applicant form/confirm not ready after 4 attempts of 10s (40s total). Skipping to next profile...")
+                progress(f"Still waiting for applicant form or Save control (attempt {parse_wait_attempts}/6)...")
+                if parse_wait_attempts >= 6:
+                    progress("Applicant form/confirm not ready after 6 attempts of 10s (60s total). Skipping to next profile...")
                     cleanup_resume_file()
-                    raise TimeoutError("Applicant form / confirm not ready after 4 attempts of 10s (40s total); skipping to next profile")
+                    raise TimeoutError("Applicant form / confirm not ready after 6 attempts of 10s (60s total); skipping to next profile")
 
             await asyncio.sleep(1)
         else:
             cleanup_resume_file()
-            raise TimeoutError("Editable applicant controls were not found after 4 attempts (40s); skipping to next profile")
+            raise TimeoutError("Editable applicant controls were not found after 6 attempts (60s); skipping to next profile")
+
+        if dialog_handler:
+            try:
+                page.remove_listener("dialog", dialog_handler)
+            except Exception:
+                pass
 
         progress("Parsed form ready; filling dummy email/mobile only when blank.")
         if not row.get("dummy_email"):
@@ -1822,6 +1893,11 @@ async def create_applicant(page, row, api, persist, job_code=None):
         raise RuntimeError("Ceipal save not confirmed; reconcile this applicant before retrying.")
 
     except Exception as exc:
+        if dialog_handler:
+            try:
+                page.remove_listener("dialog", dialog_handler)
+            except Exception:
+                pass
         if parsed_successfully:
             row["status"] = "review_required" if row.get("status") in {"saving", "review_required"} else "failed"
             row["error"] = str(exc)
